@@ -1,0 +1,10 @@
+{
+  "name": "@Presenc3/link-core",
+  "private": false,
+  "version": "0.1.0",
+  "description": "Shared WebSocket link protocol and client for inter-service communication",
+  "files":   ["src/"],
+  "author":  "Presenc3",
+  "license": "UNLICENSED",
+  "main":    "src/index.js"
+}
