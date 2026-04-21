@@ -1,7 +1,7 @@
 {
   "name": "@presenc3/link-core",
-  "version": "0.1.1",
-  "description": "Shared WebSocket link protocol and client for inter-service communication",
+  "version": "0.2.0",
+  "description": "Shared WebSocket link protocol, client, and hub for inter-service communication",
   "main": "src/index.js",
   "repository": {
     "type": "git",

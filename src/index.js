@@ -1,9 +1,11 @@
 'use strict';
 
-const   protocol        = require('./protocol.js');
+const { createHub     } = require('./hub.js');
 const { LinkBusClient } = require('./client.js');
+const   protocol        = require('./protocol.js');
 
 module.exports = {
+  createHub,
   LinkBusClient,
   sign:            protocol.sign,
   verify:          protocol.verify,
