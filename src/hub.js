@@ -208,7 +208,8 @@ function createHub({ secret, serverRpcHandlers = {}, logger } = {}) {
       }
     });
 
-    ws.on('error', () => {
+    ws.on('error', (e) => {
+      log.warn(TAG, `ws error${ws.__kind ? ` (${ws.__kind})` : ''}:`, e?.message || e);
       try { ws.close(); } catch {}
     });
   }

@@ -53,7 +53,10 @@ class LinkBusClient {
     try { this.ws?.close(); } catch {}
     if (this.statusTimer)    { clearInterval(this.statusTimer);  this.statusTimer = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    for (const [, p] of this.pending) clearTimeout(p.timeout);
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timeout);
+      p.reject(new Error('Link stopped before RPC completed'));
+    }
     this.pending.clear();
   }
 

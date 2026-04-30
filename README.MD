@@ -81,6 +81,8 @@ link.start();
 
 That's enough to connect, authenticate with the shared secret, and stay connected (it'll reconnect with exponential backoff if the hub goes away).
 
+> **`kind` is a singleton service identity, not a worker-pool name.** The hub enforces one connection per `kind`: if a second client connects with the same `kind` as a connected one, the *old* socket is closed. This is intentional — it prevents zombie connections after a hard crash + restart. If you want to run multiple instances of the same service in parallel (`worker-1`, `worker-2`, ...), give each a unique `kind`.
+
 ## A two-service example
 
 Say you have a **coordinator** that hands out jobs and a **worker** that does them. Both use the same `LinkBusClient`; the only difference is what they *do* with it.
@@ -199,6 +201,29 @@ const hub = createHub({
 });
 ```
 
+## Security & threat model
+
+`link-core` is designed for **trusted-network, single-trust-zone** deployments — services you run, talking to services you run, on infrastructure you control. Read this section before exposing a hub on a network you don't fully control.
+
+**What the protocol gives you**
+
+- **Wire integrity.** Every message carries an HMAC-SHA256 signature over its envelope. Tampering with any field breaks the signature and the message is dropped. Verification is constant-time.
+- **Anti-impersonation between authenticated peers.** Once a socket completes the `hello` handshake, the hub binds it to that `kind` and overwrites the `from` field on every forwarded message. A peer cannot forge messages claiming to come from another peer.
+
+**What the protocol does *not* give you (yet)**
+
+- **No replay protection.** Messages have `ts` and `id` fields, but the hub doesn't enforce a clock-skew window or maintain a recent-id cache. An attacker who captures a signed message on the wire (e.g., on an unencrypted `ws://` link) can re-send it and the hub will accept it. Planned for future version.
+- **No per-peer credentials.** The shared secret is all-powerful: anyone with it can connect *as any `kind`* of their choosing. They cannot impersonate per-message after handshake (see above), but they can hello-bomb to displace a legitimate peer (because the hub enforces one connection per kind, a new hello with an existing kind kicks the old socket off).
+- **No payload size cap is exposed.** The underlying `ws` library accepts the default `maxPayload` (100 MB). A misbehaving or malicious client can send large frames.
+- **No rate limiting.** A client with the secret can flood the hub.
+
+**Deployment recommendations**
+
+- Run the hub on `localhost` or a private network. If you must cross a network boundary, terminate `wss://` at a reverse proxy (nginx, Caddy, Cloudflare) — don't expose `ws://` over the public internet.
+- Treat the shared secret like a database password. Don't commit it. Rotate it if a service is compromised — rotation requires a coordinated restart of every peer.
+- The default `/state` route on `createHubServer` exposes peer kinds, hello payloads, and last-known status. Keep it on a non-public port, gate it behind your own auth, or set `enableStateRoute: false`.
+- When embedding the hub inside an existing HTTP server (`server: yourServer`), **always pass a `path`** unless you're certain no other code on that server uses WebSocket upgrades. Without it, the hub intercepts every upgrade.
+
 ## API
 
 ### `new LinkBusClient(options)`
@@ -216,7 +241,7 @@ const hub = createHub({
 Methods:
 
 - **`start()`** - Connect to the hub. No-op if `url`, `secret`, or `kind` is missing (just logs a warning).
-- **`stop()`** - Close the connection, cancel timers, and reject any pending RPCs. The client will not auto-reconnect after `stop()`.
+- **`stop()`** - Close the connection, cancel timers, and reject any pending RPCs with `Error('Link stopped before RPC completed')`. The client will not auto-reconnect after `stop()`.
 - **`isConnected()`** - `true` if the WebSocket is open.
 - **`rpc(to, rpcType, rpcData, timeoutMs = 5000)`** - Send an RPC to a peer of kind `to` (or `'server'` for hub-handled RPCs) and return a Promise that resolves with the result or rejects on error/timeout.
 - **`getPeers()`** - Returns the latest peer list from the hub: `[{ kind, hello, connectedAt, connected }, ...]`.
@@ -333,7 +358,7 @@ const httpServer = http.createServer(app);
 const linkServer = createHubServer({
   secret: process.env.LINK_SECRET,
   server: httpServer,        // BYO - no /health, no /state, no listen
-  path:   '/link',           // only intercept WS upgrades at /link
+  path:   '/link',           // strongly recommended: scope WS upgrades to one path
   handleSignals: false,      // your app probably already does this
 });
 

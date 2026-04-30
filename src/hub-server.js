@@ -103,6 +103,11 @@ function createHubServer(opts = {}) {
 
   const wss = new WebSocketServer(wsPath ? { server: httpServer, path: wsPath } : { server: httpServer });
   wss.on('connection', (ws, req) => hub.attach(ws, req));
+  wss.on('error', (e) => log.warn(TAG, 'wss error:', e?.message || e));
+
+  if (existingServer && !wsPath) {
+    log.warn(TAG, 'attached to user-provided http server without a `path` — every WebSocket upgrade on this server will be routed to the hub. Pass `path: \'/your-link-endpoint\'` to scope it.');
+  }
 
   let started        = false;
   let stopping       = false;
