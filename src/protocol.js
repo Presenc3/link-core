@@ -2,6 +2,8 @@
 
 const crypto = require('crypto');
 
+const PROTOCOL_VERSION = 1;
+
 function stableStringify(obj) {
   if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
   if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(',')}]`;
@@ -30,10 +32,11 @@ function verify(secret, msg) {
   }
 }
 
-function makeMsg(secret, { v = 1, id, ts = Date.now(), type, from = null, to = null, data }) {
-  const msg = JSON.parse(JSON.stringify({ v, id, ts, type, from, to, data }));
+// Note: 'data' is referenced, not deep-cloned
+function makeMsg(secret, { v = PROTOCOL_VERSION, id, ts = Date.now(), type, from = null, to = null, data }) {
+  const msg = { v, id, ts, type, from, to, data };
   msg.sig = sign(secret, msg);
   return msg;
 }
 
-module.exports = { makeMsg, verify, sign, stableStringify };
+module.exports = { makeMsg, verify, sign, stableStringify, PROTOCOL_VERSION };

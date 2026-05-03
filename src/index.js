@@ -9,8 +9,9 @@ module.exports = {
   createHub,
   LinkBusClient,
   createHubServer,
-  sign:            protocol.sign,
-  verify:          protocol.verify,
-  makeMsg:         protocol.makeMsg,
-  stableStringify: protocol.stableStringify,
+  sign:             protocol.sign,
+  verify:           protocol.verify,
+  makeMsg:          protocol.makeMsg,
+  stableStringify:  protocol.stableStringify,
+  PROTOCOL_VERSION: protocol.PROTOCOL_VERSION
 };

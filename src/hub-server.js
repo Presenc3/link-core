@@ -77,13 +77,24 @@ function createHubServer(opts = {}) {
         }
 
         if (enableStateRoute && pathOnly === '/state') {
+          const hubState = hub.getState();
           let extra = {};
           if (typeof extraState === 'function') {
             try { extra = (await extraState()) || {}; }
             catch (e) { log.warn(TAG, 'extraState() threw:', e?.message || e); }
           }
+
+          const merged = { ...hubState };
+          for (const k of Object.keys(extra)) {
+            if (k in hubState) {
+              log.warn(TAG, `extraState(): key '${k}' collides with hub state, ignoring`);
+            } else {
+              merged[k] = extra[k];
+            }
+          }
+
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ...hub.getState(), ...extra }, null, 2));
+          res.end(JSON.stringify(merged, null, 2));
           return;
         }
 
@@ -191,9 +202,6 @@ function createHubServer(opts = {}) {
         try { process.off(sig, handler); } catch {}
       }
       signalHandlers.clear();
-
-      started  = false;
-      stopping = false;
     })();
 
     stopPromise = (async () => {
@@ -206,6 +214,8 @@ function createHubServer(opts = {}) {
         log.warn(TAG, 'shutdown error:', e?.message || e);
         throw e;
       } finally {
+        started     = false;
+        stopping    = false;
         stopPromise = null;
       }
     })();

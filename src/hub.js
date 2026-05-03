@@ -1,7 +1,8 @@
 'use strict';
 
 const { randomUUID } = require('crypto');
-const { makeMsg, verify } = require('./protocol.js');
+
+const { makeMsg, verify, PROTOCOL_VERSION } = require('./protocol.js');
 
 const TAG = 'link-core:hub';
 
@@ -9,6 +10,7 @@ const KEEPALIVE_INTERVAL_MS = 15_000;
 const WS_OPEN = 1;
 
 const noopLogger    = { log: () => {}, warn: () => {} };
+
 const consoleLogger = {
   log:  (fn, ...args) => console.log(`[${fn}]`,  ...args),
   warn: (fn, ...args) => console.warn(`[${fn}]`, ...args),
@@ -76,6 +78,10 @@ function createHub({ secret, serverRpcHandlers = {}, logger } = {}) {
         log.warn(TAG, `dropped message: bad signature (type=${msg?.type})`);
         return;
       }
+      if (msg.v !== PROTOCOL_VERSION) {
+        log.warn(TAG, `dropped message: unsupported protocol version v=${msg?.v} (expected ${PROTOCOL_VERSION}, type=${msg?.type})`);
+        return;
+      }
 
       const type = msg.type;
 
@@ -127,8 +133,9 @@ function createHub({ secret, serverRpcHandlers = {}, logger } = {}) {
 
         // hub-handled
         if (to === 'server') {
+          const trustedMsg = { ...msg, from };
           try {
-            const result = await handleServerRpc(rpcType, rpcData, msg);
+            const result = await handleServerRpc(rpcType, rpcData, trustedMsg);
             send(ws, {
               id:   msg.id,
               type: 'rpc.response',

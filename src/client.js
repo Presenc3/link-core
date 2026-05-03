@@ -2,17 +2,20 @@
 
 const WebSocket = require('ws');
 const { randomUUID } = require('crypto');
-const { makeMsg, verify } = require('./protocol.js');
+
+const { makeMsg, verify, PROTOCOL_VERSION } = require('./protocol.js');
 
 const TAG = 'link-core';
 
-const DEFAULT_RPC_TIMEOUT_MS = 5_000;
-const STATUS_INTERVAL_MS     = 10_000;
-const RECONNECT_INITIAL_MS   = 1_000;
-const RECONNECT_MAX_MS       = 10_000;
-const RECONNECT_GROWTH       = 1.5;
+const RECONNECT_GROWTH        = 1.5;
+const RECONNECT_INITIAL_MS    = 1_000;
+const DEFAULT_RPC_TIMEOUT_MS  = 5_000;
+const HELLO_ACK_DIAGNOSTIC_MS = 5_000;
+const RECONNECT_MAX_MS        = 10_000;
+const STATUS_INTERVAL_MS      = 10_000;
 
 const noopLogger    = { log: () => {}, warn: () => {} };
+
 const consoleLogger = {
   log:  (fn, ...args) => console.log(`[${fn}]`,  ...args),
   warn: (fn, ...args) => console.warn(`[${fn}]`, ...args),
@@ -33,6 +36,8 @@ class LinkBusClient {
     this._stopped       = false;
     this.statusTimer    = null;
     this.reconnectTimer = null;
+    this.helloAckTimer  = null;
+    this._verifiedAny   = false;
 
     this.pending          = new Map();
     this.peers            = [];
@@ -44,6 +49,21 @@ class LinkBusClient {
       this.log.warn(TAG, 'start(): disabled (missing url/secret/kind)');
       return;
     }
+
+    if (this.ws && (
+        this.ws.readyState === WebSocket.OPEN
+     || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      this._stopped = false;
+      return;
+    }
+
+    // Cancel any pending reconnect — we're connecting now, don't stack timers.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     this._stopped = false;
     this._connect();
   }
@@ -53,6 +73,7 @@ class LinkBusClient {
     try { this.ws?.close(); } catch {}
     if (this.statusTimer)    { clearInterval(this.statusTimer);  this.statusTimer = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.helloAckTimer)  { clearTimeout(this.helloAckTimer);  this.helloAckTimer = null; }
     for (const [, p] of this.pending) {
       clearTimeout(p.timeout);
       p.reject(new Error('Link stopped before RPC completed'));
@@ -103,11 +124,21 @@ class LinkBusClient {
 
     this.ws.on('open', () => {
       this.reconnectMs = RECONNECT_INITIAL_MS;
+      this._verifiedAny = false;
 
       this._send('hello', {
         kind: this.kind, name: this.name,
         pid: process.pid, startedAt: Date.now(),
       });
+
+      if (this.helloAckTimer) clearTimeout(this.helloAckTimer);
+      this.helloAckTimer = setTimeout(() => {
+        this.helloAckTimer = null;
+        if (!this._verifiedAny && this.isConnected()) {
+          this.log.warn(TAG, `no verified message within ${HELLO_ACK_DIAGNOSTIC_MS}ms of connect — likely secret mismatch with the hub`);
+        }
+      }, HELLO_ACK_DIAGNOSTIC_MS);
+      this.helloAckTimer.unref?.();
 
       if (this.makeStatus) {
         const push = () => {
@@ -125,8 +156,24 @@ class LinkBusClient {
       let msg;
       try { msg = JSON.parse(String(raw)); } catch { return; }
       if (!verify(this.secret, msg)) {
-        this.log.warn(TAG, `dropped message: bad signature (type=${msg?.type})`);
+        if (!this._verifiedAny) {
+          this.log.warn(TAG, `signature verification failed before any verified message — likely secret mismatch with the hub (type=${msg?.type})`);
+        } else {
+          this.log.warn(TAG, `dropped message: bad signature (type=${msg?.type})`);
+        }
         return;
+      }
+      if (msg.v !== PROTOCOL_VERSION) {
+        this.log.warn(TAG, `dropped message: unsupported protocol version v=${msg?.v} (expected ${PROTOCOL_VERSION}, type=${msg?.type})`);
+        return;
+      }
+
+      if (!this._verifiedAny) {
+        this._verifiedAny = true;
+        if (this.helloAckTimer) {
+          clearTimeout(this.helloAckTimer);
+          this.helloAckTimer = null;
+        }
       }
 
       switch (msg.type) {
@@ -172,7 +219,17 @@ class LinkBusClient {
     });
 
     this.ws.on('close', () => {
-      if (this.statusTimer) { clearInterval(this.statusTimer); this.statusTimer = null; }
+      if (this.statusTimer)   { clearInterval(this.statusTimer); this.statusTimer = null; }
+      if (this.helloAckTimer) { clearTimeout(this.helloAckTimer); this.helloAckTimer = null; }
+
+      if (!this._stopped && this.pending.size > 0) {
+        for (const [, p] of this.pending) {
+          clearTimeout(p.timeout);
+          p.reject(new Error('Link disconnected before RPC completed'));
+        }
+        this.pending.clear();
+      }
+
       if (this._stopped) return;
 
       this.log.log(TAG, `disconnected (${this.kind}), reconnecting in ${Math.round(this.reconnectMs)}ms…`);

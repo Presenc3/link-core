@@ -372,13 +372,14 @@ httpServer.listen(8080);
 For writing tools, tests, or alternative hub implementations, the signing utilities are exported from the main entry:
 
 ```js
-const { sign, verify, makeMsg, stableStringify } = require('@presenc3/link-core');
+const { sign, verify, makeMsg, stableStringify, PROTOCOL_VERSION } = require('@presenc3/link-core');
 ```
 
-- **`makeMsg(secret, { v?, id, ts?, type, from?, to?, data })`** - Build a fully-formed, signed message envelope. `v` defaults to `1`, `ts` defaults to `Date.now()`, `from` and `to` default to `null`.
+- **`makeMsg(secret, { v?, id, ts?, type, from?, to?, data })`** - Build a fully-formed, signed message envelope. `v` defaults to `PROTOCOL_VERSION` (currently `1`), `ts` defaults to `Date.now()`, `from` and `to` default to `null`. The returned object references your `data` directly — treat `data` as immutable after the call.
 - **`sign(secret, msg)`** - Return the hex HMAC-SHA256 signature of a message (excluding its `sig` field).
 - **`verify(secret, msg)`** - Constant-time verify a signed message. Returns `true`/`false`.
 - **`stableStringify(obj)`** - Deterministic JSON stringifier with sorted keys. Used internally so signatures are stable regardless of key order.
+- **`PROTOCOL_VERSION`** - The current protocol version (`1`). Messages with a different `v` are dropped on receipt by both client and hub.
 
 ## Message envelope
 
@@ -419,13 +420,14 @@ Messages with a missing or invalid `sig` are silently dropped on both sides. The
 - **Reconnection:** exponential backoff starting at 1 s, growing 1.5× per attempt, capped at 10 s. Resets to 1 s on a successful connection.
 - **Status cadence:** `makeStatus()` (if provided) fires once on connect and then every 10 s.
 - **RPC timeouts:** default 5 s. Timed-out RPCs reject with `RPC timeout after <ms>ms: <to>:<rpcType>`. Late responses are logged and discarded.
+- **RPC disconnects:** if the socket closes while an RPC is in flight, the call rejects immediately with `Link disconnected before RPC completed` rather than waiting out its timeout.
 - **Logging:** pass `logger: null` to silence, or an object with `log(tag, ...args)` and `warn(tag, ...args)` to integrate with your own logger.
 
 ### Hub
 
 - **Keep-alive:** WebSocket-level ping every 15 s. Any socket that didn't pong back since the last ping is terminated.
 - **Single connection per kind:** when a new `hello` arrives for a kind that's already connected, the old socket is closed. This prevents zombie connections after a hard crash + restart.
-- **Trusted routing:** once a socket has completed the `hello` handshake, the hub always stamps outgoing messages with the socket's bound kind, ignoring whatever `from` a client writes. Peers can't impersonate each other.
+- **Trusted routing:** once a socket has completed the `hello` handshake, the hub always stamps outgoing messages with the socket's bound kind, ignoring whatever `from` a client writes. This applies to both peer-routed forwards *and* server RPC handlers — `serverRpcHandlers` receive `msg.from` set to the authenticated kind, not whatever the client put on the wire. Peers can't impersonate each other.
 
 ### Protocol
 
