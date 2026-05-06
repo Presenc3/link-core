@@ -1,17 +1,29 @@
 {
   "name": "@presenc3/link-core",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Shared WebSocket link protocol, client, and hub for inter-service communication",
-  "main": "./src/index.js",
+  "main":   "./src/index.js",
+  "module": "./src/index.mjs",
+  "types":  "./src/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "types":   "./src/index.d.ts",
+      "import":  "./src/index.mjs",
+      "require": "./src/index.js",
+      "default": "./src/index.js"
+    },
     "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "src",
+    "CHANGELOG.MD",
+    "LICENSE",
     "package.json",
-    "README.MD",
-    "LICENSE"
+    "README.MD"
   ],
   "keywords": [
     "websocket",
@@ -35,9 +47,13 @@
   },
   "homepage": "https://github.com/Presenc3/link-core#readme",
   "dependencies": {
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "@types/ws": "^8.18.1"
   },
   "engines": {
     "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
   }
 }

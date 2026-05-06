@@ -2,22 +2,19 @@
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { createHub } = require('./hub.js');
+
+const { createHub } = require('./index.js');
+const { noopLogger, consoleLogger } = require('../util/log.js');
 
 const TAG = 'link-core:hub-server';
 
-const WS_CLOSED                   = 3;
+const WS_CLOSED    = 3;
+const DEFAULT_PORT = 8080;
+const DEFAULT_HOST = '0.0.0.0';
+
 const DEFAULT_DRAIN_DELAY_MS      = 250;
-const DEFAULT_PORT                = 8080;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
-const DEFAULT_HOST                = '0.0.0.0';
-
-const noopLogger    = { log: () => {}, warn: () => {} };
-
-const consoleLogger = {
-  log:  (fn, ...args) => console.log(`[${fn}]`,  ...args),
-  warn: (fn, ...args) => console.warn(`[${fn}]`, ...args),
-};
+const DEFAULT_MAX_MESSAGE_BYTES   = 1_048_576;
 
 function pickPath(url) {
   if (typeof url !== 'string') return '/';
@@ -29,7 +26,7 @@ function pickPath(url) {
 function createHubServer(opts = {}) {
   const {
     secret,
-    serverRpcHandlers = {},
+    rpcHandlers = {},
 
     path: wsPath,
     host = DEFAULT_HOST,
@@ -47,14 +44,34 @@ function createHubServer(opts = {}) {
     drainDelayMs      = DEFAULT_DRAIN_DELAY_MS,
     shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
 
+    keepaliveIntervalMs,
+    replayWindowMs,
+    maxRecentIds,
+    maxMessageBytes = DEFAULT_MAX_MESSAGE_BYTES,
+    maxBufferedBytes,
+    helloTimeoutMs,
+    hashAlgo,
+    perMessageDeflate = false,
+
     logger,
   } = opts;
 
-  if (!secret) throw new Error('createHubServer({ secret }) is required');
+  if (secret == null) throw new Error('createHubServer({ secret }) is required');
 
   const log = logger === null ? noopLogger : (logger || consoleLogger);
 
-  const hub = createHub({ secret, serverRpcHandlers, logger: log });
+  const hub = createHub({
+    secret,
+    rpcHandlers,
+    logger: log,
+    keepaliveIntervalMs,
+    replayWindowMs,
+    maxRecentIds,
+    maxMessageBytes,
+    maxBufferedBytes,
+    helloTimeoutMs,
+    hashAlgo,
+  });
 
   const ownsHttpServer = !existingServer;
   let httpServer = existingServer;
@@ -72,7 +89,7 @@ function createHubServer(opts = {}) {
 
         if (enableHealthRoute && pathOnly === '/health') {
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, now: Date.now() }));
+          res.end(JSON.stringify({ ok: true, now: Date.now(), hub: hub.health() }));
           return;
         }
 
@@ -112,12 +129,20 @@ function createHubServer(opts = {}) {
     });
   }
 
-  const wss = new WebSocketServer(wsPath ? { server: httpServer, path: wsPath } : { server: httpServer });
+  const wssOpts = {
+    server:      httpServer,
+    maxPayload:  maxMessageBytes,
+    perMessageDeflate,
+    ...(wsPath ? { path: wsPath } : {}),
+  };
+
+  const wss = new WebSocketServer(wssOpts);
+
   wss.on('connection', (ws, req) => hub.attach(ws, req));
   wss.on('error', (e) => log.warn(TAG, 'wss error:', e?.message || e));
 
   if (existingServer && !wsPath) {
-    log.warn(TAG, 'attached to user-provided http server without a `path` — every WebSocket upgrade on this server will be routed to the hub. Pass `path: \'/your-link-endpoint\'` to scope it.');
+    log.warn(TAG, 'attached to user-provided http server without a `path` - every WebSocket upgrade on this server will be routed to the hub. Pass `path: \'/your-link-endpoint\'` to scope it.');
   }
 
   let started        = false;
@@ -127,21 +152,31 @@ function createHubServer(opts = {}) {
 
   async function start() {
     if (started) return;
-    started = true;
 
     if (ownsHttpServer) {
-      await new Promise((resolve, reject) => {
-        const onError     = (e) => { httpServer.off('listening', onListening); reject(e); };
-        const onListening = ()   => { httpServer.off('error',    onError);     resolve(); };
-        httpServer.once('error',     onError);
-        httpServer.once('listening', onListening);
-        httpServer.listen(port, host);
-      });
+      try {
+        await new Promise((resolve, reject) => {
+          const onError     = (e) => { httpServer.off('listening', onListening); reject(e); };
+          const onListening = ()   => { httpServer.off('error',    onError);     resolve(); };
+
+          httpServer.once('error',     onError);
+          httpServer.once('listening', onListening);
+          httpServer.listen(port, host);
+        });
+      } catch (e) {
+        // listen failed (e.g. EADDRINUSE) - leave `started` false so the
+        // caller can fix the port and retry start().
+        throw e;
+      }
+
       log.log(TAG, `listening on http://${host}:${port}`);
       log.log(TAG, `ws on ws://${host}:${port}${wsPath || ''}`);
+
     } else {
       log.log(TAG, 'attached to user-provided http server');
     }
+
+    started = true;
 
     if (handleSignals) {
       for (const sig of signals) {
@@ -154,6 +189,16 @@ function createHubServer(opts = {}) {
 
   async function stop(reason) {
     if (stopPromise) return stopPromise;
+
+    // Idempotent fast-path: if start() was never called (or already fully
+    // shut down), there's nothing to drain. Just tear down the hub and
+    // return - don't enter the timeout-bounded shutdown path, which would
+    // block on `wssClosed` for a wss that never had any clients.
+    if (!started) {
+      try { hub.stop(); } catch (e) { log.warn(TAG, 'hub.stop() error:', e?.message || e); }
+      return;
+    }
+
     stopping = true;
 
     log.log(TAG, `shutting down${reason ? ` (${reason})` : ''}...`);
@@ -164,6 +209,7 @@ function createHubServer(opts = {}) {
         () => reject(new Error(`shutdown timeout after ${shutdownTimeoutMs}ms`)),
         shutdownTimeoutMs,
       );
+
       timeoutHandle.unref?.();
     });
 
@@ -171,6 +217,7 @@ function createHubServer(opts = {}) {
       const wssClosed = new Promise((resolve) => {
         wss.once('close', resolve);
       });
+
       try { wss.close(); }
       catch (e) { log.warn(TAG, 'wss.close() error:', e?.message || e); }
 
@@ -179,6 +226,7 @@ function createHubServer(opts = {}) {
       }
 
       await new Promise((r) => setTimeout(r, drainDelayMs));
+
       for (const ws of wss.clients) {
         try { if (ws.readyState !== WS_CLOSED) ws.terminate(); } catch {}
       }
@@ -208,10 +256,12 @@ function createHubServer(opts = {}) {
       try {
         await Promise.race([work, timeout]);
         if (timeoutHandle) clearTimeout(timeoutHandle);
+
         log.log(TAG, 'shutdown complete');
       } catch (e) {
         if (timeoutHandle) clearTimeout(timeoutHandle);
         log.warn(TAG, 'shutdown error:', e?.message || e);
+        
         throw e;
       } finally {
         started     = false;
@@ -229,6 +279,7 @@ function createHubServer(opts = {}) {
     stop,
     start,
     httpServer,
+    health:   () => hub.health(),
     getState: () => hub.getState(),
     get isStarted()       { return started;        },
     get isStopping()      { return stopping;       },
