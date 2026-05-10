@@ -108,10 +108,6 @@ export function verify(secret: string, msg: unknown, algo?: string): boolean;
 /** Deterministic JSON stringifier with sorted keys. Used for stable signing. */
 export function stableStringify(obj: unknown): string;
 
-// ---------------------------------------------------------------------------
-// Pub/sub topics
-// ---------------------------------------------------------------------------
-
 /** Maximum permitted topic length, in characters. */
 export const TOPIC_MAX_LENGTH: number;
 
@@ -131,7 +127,7 @@ export function assertValidTopic(topic: unknown): asserts topic is string;
 export type TopicHandler<TPayload = unknown> = (
   payload: TPayload,
   msg:     MessageEnvelope<{ topic: string; payload: TPayload }>,
-) => void;
+) => void | Promise<void>;
 
 /**
  * Reasons that may appear on a `'protocol-error'` event payload's `reason`
@@ -144,10 +140,17 @@ export type TopicHandler<TPayload = unknown> = (
  *   - `bad-version`        - message `v` differs from PROTOCOL_VERSION.
  *   - `replay-window`      - `ts` outside the configured replay window.
  *   - `replay-id`          - message `id` already seen recently.
+ *   - `missing-id`         - envelope `id` was missing or empty.
  *   - `oversize`           - message exceeded `maxMessageBytes`.
  *   - `no-ack`             - client-only: saw no verified message within
  *                            `helloAckDiagnosticMs` (likely secret mismatch).
- *   - `bad-hello`          - hub-only: hello arrived missing/invalid kind.
+ *   - `bad-hello`          - hub-only: hello arrived with a missing,
+ *                            oversized, or pattern-failing `kind`. The
+ *                            `detail` field disambiguates: `'missing-kind'`,
+ *                            `'oversized-kind'`, or `'invalid-kind'`.
+ *   - `duplicate-hello`    - hub-only: a second hello arrived on a socket
+ *                            that was already authenticated by a prior
+ *                            (concurrent) hello.
  *   - `unknown-kind`       - hub-only: per-peer mode resolver returned no
  *                            key for the claimed kind.
  *   - `pre-hello-message`  - hub-only: a non-hello message arrived from an
@@ -161,9 +164,11 @@ export type ProtocolErrorReason =
   | 'bad-version'
   | 'replay-window'
   | 'replay-id'
+  | 'missing-id'
   | 'oversize'
   | 'no-ack'
   | 'bad-hello'
+  | 'duplicate-hello'
   | 'unknown-kind'
   | 'pre-hello-message'
   | 'invalid-topic';
@@ -175,6 +180,7 @@ export type ClientProtocolErrorReason =
   | 'bad-version'
   | 'replay-window'
   | 'replay-id'
+  | 'missing-id'
   | 'oversize'
   | 'no-ack';
 
@@ -185,8 +191,10 @@ export type HubProtocolErrorReason =
   | 'bad-version'
   | 'replay-window'
   | 'replay-id'
+  | 'missing-id'
   | 'oversize'
   | 'bad-hello'
+  | 'duplicate-hello'
   | 'unknown-kind'
   | 'pre-hello-message'
   | 'invalid-topic';
@@ -288,9 +296,16 @@ export class RpcDisconnectError extends RpcError {
 }
 
 /**
- * Caller-supplied `AbortSignal` fired before the response arrived. Mirrors
- * the `AbortError` name on `DOMException` for consistency with `fetch()`
- * and other AbortSignal-aware APIs in Node.
+ * Caller-supplied `AbortSignal` fired before the response arrived. Has
+ * `name === 'RpcAbortError'` and `code === 'RPC_ABORT'`. Note that this is
+ * **distinct from the DOM-style `AbortError`** that `fetch()` and other
+ * AbortSignal-aware Node APIs reject with: a `try/catch` that pattern-matches
+ * on `err.name === 'AbortError'` will *not* match this class. Branch on
+ * `instanceof RpcAbortError` or `err.code === 'RPC_ABORT'` instead.
+ *
+ * Note: `link.ready({ signal })` and `link.waitFor(event, { signal })` are
+ * pre-RPC lifecycle waits and reject with a plain `Error` whose
+ * `name === 'AbortError'` (no `code`), not with this class.
  */
 export class RpcAbortError extends RpcError {
   code: 'RPC_ABORT';
@@ -406,7 +421,12 @@ export interface LinkClientOptions {
    * with the recipient's key.
    */
   secret: string;
-  /** Service-type identifier; e.g. 'worker'. Singleton per hub. */
+  /**
+   * Service-type identifier; e.g. `'worker'`. Singleton per hub. Must
+   * match `[a-zA-Z0-9._-]+`, length 1–256 (same character class as topics);
+   * the hub will reject the hello as `'bad-hello'` (`detail: 'invalid-kind'`)
+   * otherwise.
+   */
   kind:   string;
   /** Human-readable instance name. Defaults to `kind`. */
   name?:  string;
@@ -434,6 +454,17 @@ export interface LinkClientOptions {
 
   /** Reconnect backoff growth factor. Default: 1.5. */
   reconnectGrowth?:     number;
+
+  /**
+   * Reconnect-delay jitter factor in `[0, 1]`. The actual scheduled delay is
+   * `reconnectMs * (1 - jitter/2 + Math.random() * jitter)`, so the default
+   * `0.5` produces a uniform spread of `[reconnectMs * 0.75, reconnectMs * 1.25]`,
+   * `0` disables jitter (deterministic exponential backoff), and `1` produces
+   * the widest spread `[reconnectMs * 0.5, reconnectMs * 1.5]`. Useful to
+   * avoid thundering-herd reconnects when many peers drop together (e.g. on
+   * hub restart). Default: 0.5.
+   */
+  reconnectJitter?:     number;
 
   /**
    * Time after `open` to wait for any verified message before warning about a
@@ -535,9 +566,11 @@ export interface LinkClientEvents {
 
   /**
    * The hub rejected the hello (`hello.ack` with `ok: false`). By default
-   * the client then `stop()`s itself - the subsequent `'disconnect'`
-   * event will have `willReconnect: false`. Set
-   * `reconnectOnRejection: true` to keep retrying.
+   * the client then `stop()`s itself; because the link never reached the
+   * `'ready'` state, **no follow-up `'disconnect'` event fires** (it's gated
+   * on `wasReady`). React to this case by listening for `'rejected'`
+   * directly, or set `reconnectOnRejection: true` to keep retrying instead
+   * of stopping.
    */
   'rejected':        (info: { reason: string; error: string | null }) => void;
 
@@ -917,10 +950,6 @@ export type LinkBusClientOptions = LinkClientOptions;
 /** @deprecated Use `LinkClientEvents`. */
 export type LinkBusClientEvents = LinkClientEvents;
 
-// ---------------------------------------------------------------------------
-// createHub
-// ---------------------------------------------------------------------------
-
 /**
  * The hub's `secret` option accepts three shapes:
  *
@@ -1119,8 +1148,6 @@ export interface Hub extends EventEmitter {
   getState()                                     : HubState;
   health()                                       : HubHealthSnapshot;
   stop()                                         : void;
-
-  // --- Typed event-emitter overloads ---
 
   on<K             extends keyof HubEvents>(event: K, listener: HubEvents[K])             : this;
   once<K           extends keyof HubEvents>(event: K, listener: HubEvents[K])             : this;

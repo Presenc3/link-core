@@ -9,6 +9,7 @@
 
 const { createHubServer } = require('../src/index.js');
 
+const fn = '[ Hub ]';
 const PORT = Number(process.env.LINK_PORT) || 8080;
 
 /*
@@ -19,42 +20,43 @@ const PORT = Number(process.env.LINK_PORT) || 8080;
   * secret: async (kind) => vault.get(`link-core/keys/${kind}`)
 **/
 const KEYS = {
-  vault:       process.env.LINK_KEY_VAULT       || 'dev-vault-key',
-  worker:      process.env.LINK_KEY_WORKER      || 'dev-worker-key',
-  coordinator: process.env.LINK_KEY_COORDINATOR || 'dev-coord-key',
+  vault       : process.env.LINK_KEY_VAULT       || 'dev-vault-key',
+  worker      : process.env.LINK_KEY_WORKER      || 'dev-worker-key',
+  coordinator : process.env.LINK_KEY_COORDINATOR || 'dev-coord-key'
 };
 
 const server = createHubServer({
-  port:   PORT,
-  secret: KEYS,
-
+  port   : PORT,
+  secret : KEYS,
   // Clients call this with: link.rpc('server', 'hub.now', {})
-  rpcHandlers: {
-    'hub.now': async () => ({ now: Date.now() }),
-  },
+  rpcHandlers : { 'hub.now' : async () => ({ now: Date.now() }) }
 });
 
-server.hub.on('peer.connect',     ({ kind, replaced }) => {
-  console.log(`[hub] + ${kind}${replaced ? ' (replaced previous connection)' : ''}`);
+server.hub.on('peer.connect', ({ kind, replaced }) => {
+  console.log(
+   `${fn} + ${kind}${replaced ? ' (replaced previous connection)' : ''}`);
 });
 
-server.hub.on('peer.disconnect',  ({ kind, reason }) => {
-  console.log(`[hub] - ${kind}${reason ? ` (${reason})` : ''}`);
+server.hub.on('peer.disconnect', ({ kind, reason }) => {
+  console.log(
+   `${fn} - ${kind}${reason ? ` (${reason})` : ''}`);
 });
 
-server.hub.on('peer.timeout',     ({ remoteAddress }) => {
-  console.warn(`[hub] pre-hello timeout from ${remoteAddress || '<unknown>'}`);
+server.hub.on('peer.timeout', ({ remoteAddress }) => {
+  console.warn(
+   `${fn} pre-hello timeout from ${remoteAddress || '<unknown>'}`);
 });
 
-server.hub.on('protocol-error',   ({ reason, kind }) => {
-  console.warn(`[hub] protocol-error: ${reason} (kind=${kind || '<pending>'})`);
+server.hub.on('protocol-error', ({ reason, kind }) => {
+  console.warn(
+   `${fn} protocol-error: ${reason} (kind=${kind || '<pending>'})`);
 });
 
 server.start().then(() => {
-  console.log(`[hub] listening on http://0.0.0.0:${PORT}`);
-  console.log(`[hub] ws on ws://0.0.0.0:${PORT}`);
-  console.log(`[hub] /health and /state available on http://localhost:${PORT}`);
+  console.log(`${fn} listening on http://0.0.0.0:${PORT}`);
+  console.log(`${fn} ws on ws://0.0.0.0:${PORT}`);
+  console.log(`${fn} /health and /state available on http://localhost:${PORT}`);
 }).catch((e) => {
-  console.error('[hub] failed to start:', e);
+  console.error(`${fn} failed to start: `, e);
   process.exit(1);
 });

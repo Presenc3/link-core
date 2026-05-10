@@ -1,6 +1,6 @@
 {
   "name": "@presenc3/link-core",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Shared WebSocket link protocol, client, and hub for inter-service communication",
   "main":   "./src/index.js",
   "module": "./src/index.mjs",
@@ -22,8 +22,8 @@
     "src",
     "CHANGELOG.MD",
     "LICENSE",
-    "package.json",
-    "README.MD"
+    "README.MD",
+    "SECURITY.MD"
   ],
   "keywords": [
     "websocket",
@@ -47,8 +47,15 @@
   },
   "homepage": "https://github.com/Presenc3/link-core#readme",
   "dependencies": {
-    "ws": "^8.20.0",
+    "ws": "^8.20.0"
+  },
+  "peerDependencies": {
     "@types/ws": "^8.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@types/ws": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=18"

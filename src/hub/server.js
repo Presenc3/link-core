@@ -59,6 +59,23 @@ function createHubServer(opts = {}) {
   if (secret == null) throw new Error('createHubServer({ secret }) is required');
 
   const log = logger === null ? noopLogger : (logger || consoleLogger);
+  const hostExplicit       = 'host'             in opts;
+  const stateRouteExplicit = 'enableStateRoute' in opts;
+
+  if (
+    !existingServer
+    && enableStateRoute
+    && host === '0.0.0.0'
+    && !(hostExplicit && stateRouteExplicit)
+  ) {
+    log.warn(
+      TAG,
+      `binding 0.0.0.0 with /state enabled - the route exposes peer kinds, ` +
+      `hello payloads, and last-known statuses. To silence this warning, ` +
+      `pass either { enableStateRoute: false }, { host: '127.0.0.1' }, or ` +
+      `set both options explicitly to acknowledge the exposure.`,
+    );
+  }
 
   const hub = createHub({
     secret,
@@ -164,8 +181,6 @@ function createHubServer(opts = {}) {
           httpServer.listen(port, host);
         });
       } catch (e) {
-        // listen failed (e.g. EADDRINUSE) - leave `started` false so the
-        // caller can fix the port and retry start().
         throw e;
       }
 
@@ -190,10 +205,6 @@ function createHubServer(opts = {}) {
   async function stop(reason) {
     if (stopPromise) return stopPromise;
 
-    // Idempotent fast-path: if start() was never called (or already fully
-    // shut down), there's nothing to drain. Just tear down the hub and
-    // return - don't enter the timeout-bounded shutdown path, which would
-    // block on `wssClosed` for a wss that never had any clients.
     if (!started) {
       try { hub.stop(); } catch (e) { log.warn(TAG, 'hub.stop() error:', e?.message || e); }
       return;

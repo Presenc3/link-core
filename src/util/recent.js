@@ -35,6 +35,8 @@ class RecentIds {
       this.entries.delete(k);
     }
 
+    if (this.entries.has(id)) this.entries.delete(id);
+
     while (this.entries.size >= this.maxCount) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;

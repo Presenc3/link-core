@@ -4,31 +4,15 @@ const { sanitizeHello }    = require('./hello.js');
 const { TAG, WS_OPEN, HUB_FEATURES } = require('./constants.js');
 const { verify, PROTOCOL_VERSION, isValidTopic } = require('../protocol.js');
 
-
-/**
- * Build the `ws.on('message', ...)` handler for a single attached socket.
- *
- * `ctx` is the state/helpers bag supplied by `createHub` - all closures over
- * the per-hub maps (clients, statuses, subscriptions, recentIds), config
- * (hashAlgo, replayWindowMs, rpcHandlers), the secret resolver, and the
- * helper functions (send, broadcast, publishPeers, dropSubscriptionsFor,
- * untrackPending, emitSafe, log, handleServerRpc).
- *
- * The handler runs the seven-step verification chain (size, parse, resolve
- * verifying key, signature, protocol version, replay window, replay id),
- * fires the firehose `'message'` event, then dispatches by `msg.type`.
- */
 function createMessageHandler(ctx, ws) {
   const {
-    log, hashAlgo, replayWindowMs, maxMessageBytes,
-    clients, statuses, subscriptions, recentIds,
-    resolveSecret, rpcHandlers, builtinRpcs,
-    send, broadcast, publishPeers, dropSubscriptionsFor,
-    untrackPending, emitSafe, handleServerRpc,
+    log,            hashAlgo,     replayWindowMs, maxMessageBytes,
+    clients,        statuses,     subscriptions,  recentIds,
+    resolveSecret,  send,         broadcast,      publishPeers,
+    untrackPending, emitSafe,     handleServerRpc,
   } = ctx;
 
   return async (raw) => {
-    // 1. Defensive size check
     if (raw.length > maxMessageBytes) {
       log.warn(TAG, `dropped: message too large (${raw.length} bytes > ${maxMessageBytes})`);
 
@@ -41,7 +25,6 @@ function createMessageHandler(ctx, ws) {
       return;
     }
 
-    // 2. Parse
     let msg;
     try { msg = JSON.parse(String(raw)); }
     catch {
@@ -49,19 +32,37 @@ function createMessageHandler(ctx, ws) {
       return;
     }
 
-    // 3. Resolve the secret to verify with
-    let verifyKey;
+    if (typeof msg?.id !== 'string' || msg.id.length === 0) {
+      log.warn(TAG, `dropped: missing or empty id (type=${msg?.type})`);
+
+      emitSafe('protocol-error', {
+        reason: 'missing-id',
+        kind:   ws.__kind || null,
+        type:   msg?.type,
+      });
+
+      return;
+    }
+
+    let verifyKey, helloData;
 
     if (ws.__secret) {
       verifyKey = ws.__secret;
 
     } else if (msg?.type === 'hello') {
-      const claimedKind = sanitizeHello(msg.data).kind;
+      helloData = sanitizeHello(msg.data);
+      const claimedKind = helloData.kind;
 
       if (!claimedKind) {
-        log.warn(TAG, `dropped hello: missing or invalid kind`);
-        emitSafe('protocol-error', { reason: 'bad-hello', kind: null, detail: 'missing-kind' });
-        try { ws.close(1008, 'missing kind'); } catch {}
+        const rawKind = String(msg.data?.kind ?? '');
+        const detail =
+          rawKind.length === 0       ? 'missing-kind' :
+          rawKind.length > 256       ? 'oversized-kind' :
+                                       'invalid-kind';
+
+        log.warn(TAG, `dropped hello: ${detail} (raw=${JSON.stringify(rawKind.slice(0, 64))})`);
+        emitSafe('protocol-error', { reason: 'bad-hello', kind: null, detail });
+        try { ws.close(1008, detail); } catch {}
         return;
       }
 
@@ -72,12 +73,17 @@ function createMessageHandler(ctx, ws) {
         emitSafe('protocol-error', { reason: 'unknown-kind', kind: claimedKind });
         return;
       }
+
+      if (ws.__secret) {
+        log.warn(TAG, `dropped hello: socket already authenticated as ${ws.__kind}`);
+        emitSafe('protocol-error', { reason: 'duplicate-hello', kind: ws.__kind });
+        return;
+      }
     } else {
       emitSafe('protocol-error', { reason: 'pre-hello-message', kind: null, type: msg?.type });
       return;
     }
 
-    // 4. Verify signature
     if (!verify(verifyKey, msg, hashAlgo)) {
       log.warn(TAG, `dropped: bad signature (type=${msg?.type}, kind=${ws.__kind || '<pending>'})`);
 
@@ -90,7 +96,6 @@ function createMessageHandler(ctx, ws) {
       return;
     }
 
-    // 5. Protocol version
     if (msg.v !== PROTOCOL_VERSION) {
       log.warn(TAG, `dropped: unsupported protocol version v=${msg?.v} (expected ${PROTOCOL_VERSION}, type=${msg?.type})`);
 
@@ -103,7 +108,6 @@ function createMessageHandler(ctx, ws) {
       return;
     }
 
-    // 6. Replay: timestamp window
     if (replayWindowMs > 0) {
       const skew = Math.abs(Date.now() - (typeof msg.ts === 'number' ? msg.ts : 0));
 
@@ -120,9 +124,11 @@ function createMessageHandler(ctx, ws) {
       }
     }
 
-    // 7. Replay: id duplicate
-    if (recentIds && msg.id && msg.type !== 'rpc.response') {
-      if (recentIds.has(msg.id)) {
+    if (recentIds && msg.type !== 'rpc.response') {
+      const senderKind = ws.__kind || (msg.type === 'hello' ? helloData?.kind : null);
+      const cacheKey = senderKind ? `${senderKind}|${msg.id}` : msg.id;
+
+      if (recentIds.has(cacheKey)) {
         log.warn(TAG, `dropped: replay of id ${String(msg.id).slice(0, 8)} (type=${msg?.type})`);
 
         emitSafe('protocol-error', {
@@ -134,16 +140,14 @@ function createMessageHandler(ctx, ws) {
         return;
       }
 
-      recentIds.add(msg.id);
+      recentIds.add(cacheKey);
     }
 
-    // Firehose: every verified message
     emitSafe('message', { from: ws.__kind || null, msg });
 
     const type = msg.type;
 
     if (type === 'hello') {
-      const helloData = sanitizeHello(msg.data);
       const kind = helloData.kind;
 
       const existing = clients.get(kind);

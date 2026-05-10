@@ -4,21 +4,22 @@ const   WebSocket      = require('ws');
 const { randomUUID   } = require('crypto');
 const { EventEmitter } = require('events');
 
-const { handleInboundMessage, handleClose } = require('./inbound.js');
-
 const {
   TAG,
-  DEFAULT_RECONNECT_GROWTH,
-  DEFAULT_RECONNECT_INITIAL_MS,
   DEFAULT_RPC_TIMEOUT_MS,
-  DEFAULT_HELLO_ACK_DIAGNOSTIC_MS,
   DEFAULT_MAX_RECENT_IDS,
+  DEFAULT_RECONNECT_GROWTH,
+  DEFAULT_RECONNECT_JITTER,
   DEFAULT_RECONNECT_MAX_MS,
-  DEFAULT_STATUS_INTERVAL_MS,
-  DEFAULT_MAX_MESSAGE_BYTES,
   DEFAULT_REPLAY_WINDOW_MS,
+  DEFAULT_MAX_MESSAGE_BYTES,
+  DEFAULT_STATUS_INTERVAL_MS,
   DEFAULT_MAX_BUFFERED_BYTES,
+  DEFAULT_RECONNECT_INITIAL_MS,
+  DEFAULT_HELLO_ACK_DIAGNOSTIC_MS
 } = require('./constants.js');
+
+const { handleInboundMessage, handleClose } = require('./inbound.js');
 
 const {
   makeMsg, assertValidTopic, DEFAULT_HASH_ALGO,
@@ -47,6 +48,7 @@ class LinkClient extends EventEmitter {
     defaultRpcTimeoutMs   = DEFAULT_RPC_TIMEOUT_MS,
     reconnectMaxMs        = DEFAULT_RECONNECT_MAX_MS,
     reconnectGrowth       = DEFAULT_RECONNECT_GROWTH,
+    reconnectJitter       = DEFAULT_RECONNECT_JITTER,
     replayWindowMs        = DEFAULT_REPLAY_WINDOW_MS,
     maxMessageBytes       = DEFAULT_MAX_MESSAGE_BYTES,
     maxBufferedBytes      = DEFAULT_MAX_BUFFERED_BYTES,
@@ -67,6 +69,7 @@ class LinkClient extends EventEmitter {
     this.reconnectMaxMs       = reconnectMaxMs;
     this.replayWindowMs       = replayWindowMs;
     this.reconnectGrowth      = reconnectGrowth;
+    this.reconnectJitter      = Math.min(1, Math.max(0, Number(reconnectJitter) || 0));
     this.maxMessageBytes      = maxMessageBytes;
     this.statusIntervalMs     = statusIntervalMs;
     this.maxBufferedBytes     = maxBufferedBytes;
@@ -98,8 +101,6 @@ class LinkClient extends EventEmitter {
     this.reconnectMs       = reconnectInitialMs;
   }
 
-  // === Lifecycle ========================================================
-
   start() {
     if (!this.url || !this.secret || !this.kind
      ) return this.log.warn(TAG, 'start(): disabled (missing url/secret/kind)');
@@ -126,20 +127,16 @@ class LinkClient extends EventEmitter {
   }
 
   stop() {
-    // Capture state BEFORE clearing flags so we can emit a sensible
-    // 'disconnect' if we were ready. This mirrors what handleClose() would
-    // emit if the close handler had run naturally - but stop() detaches
-    // listeners first, so the close handler never fires and we have to
-    // reproduce the bookkeeping here.
     const wasReady = this._ready;
 
     this._stopped     = true;
     this._ready       = false;
     this._verifiedAny = false;
+    this.hubFeatures  = null;
 
     if (this.ws) {
       this._detachWs(this.ws);
-      try { this.ws.close(); } catch {};
+      try { this.ws.close(); } catch {}
     }
 
     if (this.statusTimer)    { clearInterval(this.statusTimer);    this.statusTimer    = null; }
@@ -161,8 +158,6 @@ class LinkClient extends EventEmitter {
 
     this.pending.clear();
 
-    // Only emit 'disconnect' if we were actually ready - calling stop() on a
-    // never-started or pre-ready client should be a quiet teardown.
     if (wasReady) {
       try {
         this.emit('disconnect', {
@@ -186,8 +181,6 @@ class LinkClient extends EventEmitter {
     try { ws.on('error', () => {});         } catch {}
   }
 
-  // === Status / introspection ===========================================
-
   isConnected() { return !!this.ws && this.ws.readyState === WebSocket.OPEN; }
   isReady()     { return this._ready; }
   getPeers()    { return this.peers;  }
@@ -207,8 +200,6 @@ class LinkClient extends EventEmitter {
       bufferedAmount    : this.ws ? (this.ws.bufferedAmount || 0) : 0
     };
   }
-
-  // === Fire-and-forget primitives =======================================
 
   send(to, type, data) {
     if (typeof to !== 'string' || !to
@@ -251,8 +242,6 @@ class LinkClient extends EventEmitter {
     return this._send('topic.message', { topic, payload }) !== false;
   }
 
-  // === Subscriptions ====================================================
-
   subscribe(topic, handler) {
     assertValidTopic(topic);
 
@@ -290,8 +279,6 @@ class LinkClient extends EventEmitter {
     return true;
   }
 
-  // === RPC handler registry =============================================
-
   handle(rpcType, fn) {
     if (typeof rpcType !== 'string' || !rpcType
      ) throw new TypeError('handle(rpcType, fn): "rpcType" must be a non-empty string');
@@ -310,8 +297,6 @@ class LinkClient extends EventEmitter {
     delete this.rpcHandlers[rpcType];
     return true;
   }
-
-  // === Awaiters (waitFor / ready) =======================================
 
   waitFor(event, opts = {}) {
     const { timeoutMs = 0, signal } = opts;
@@ -390,9 +375,6 @@ class LinkClient extends EventEmitter {
       return Promise.reject(err);
     }
 
-    // After stop(), ready() should reject fast rather than hang or quietly
-    // resurrect the client. Callers who want to restart should call start()
-    // explicitly.
     if (this._stopped) {
       return Promise.reject(new LinkNotReadyError(
         'ready(): link has been stopped - call start() to reconnect',
@@ -466,8 +448,6 @@ class LinkClient extends EventEmitter {
       }
     });
   }
-
-  // === RPC ==============================================================
 
   rpc(to, rpcType, rpcData, optsOrTimeoutMs) {
     const opts = (typeof optsOrTimeoutMs === 'number')
@@ -626,8 +606,6 @@ class LinkClient extends EventEmitter {
       this._send('rpc.response', { ok: false, error: e?.message || String(e) }, msg.from, msg.id);
     }
   }
-
-  // === Private send + connect ===========================================
 
   _send(type, data, to = null, id = randomUUID()) {
     if (!this.isConnected()) return false;

@@ -4,11 +4,11 @@ const { test, before, after, describe } = require('node:test');
 const assert = require('node:assert');
 
 const {
-  createHubServer, LinkClient,
-  RpcRemoteError, RpcDisconnectError, RpcAbortError, RpcTimeoutError,
-  BackpressureError, HelloRejectedError,
-  LinkNotReadyError, FeatureUnsupportedError,
-  makeMsg,
+  createHubServer,         LinkClient,
+  RpcRemoteError,          RpcDisconnectError,
+  RpcAbortError,           RpcTimeoutError,
+  BackpressureError,       LinkNotReadyError,
+  FeatureUnsupportedError, makeMsg
 } = require('../src/index.js');
 
 const PORT = 18800;
@@ -60,7 +60,7 @@ describe('connection lifecycle', () => {
     c.stop();
   });
 
-  test('ready() rejects with HelloRejectedError on per-peer-keys mismatch', async () => {
+  test('ready() times out on per-peer-keys mismatch (hub silently drops bad hello)', async () => {
     const PORT2 = 18801;
     const ppServer = createHubServer({
       port: PORT2, logger: null, handleSignals: false,
@@ -366,6 +366,42 @@ describe('pub/sub', () => {
 
     a.stop(); b.stop();
   });
+
+  test('async topic handler that rejects does not surface as unhandledRejection', async () => {
+    const a = await readyClient({ kind: 'ah-pub' });
+    const b = await readyClient({ kind: 'ah-sub' });
+
+    const captured = [];
+    const onUnhandled = (reason) => { captured.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+
+    const recordingLogger = {
+      logs: [],
+      log:  () => {},
+      warn: (tag, ...args) => { recordingLogger.logs.push({ tag, msg: args.join(' ') }); },
+    };
+    b.log = recordingLogger;
+
+    let syncCalls  = 0;
+    let asyncCalls = 0;
+    b.subscribe('ah.events', (p) => { syncCalls++; throw new Error('sync boom'); });
+    b.subscribe('ah.events', async (p) => { asyncCalls++; throw new Error('async boom'); });
+    await tick();
+
+    a.publish('ah.events', { x: 1 });
+    await tick(80);
+
+    process.off('unhandledRejection', onUnhandled);
+
+    assert.strictEqual(syncCalls,  1);
+    assert.strictEqual(asyncCalls, 1);
+    assert.strictEqual(captured.length, 0,
+      'async topic handler rejection must not surface as unhandledRejection');
+    const warned = recordingLogger.logs.filter((e) => /topic handler/.test(e.msg));
+    assert.ok(warned.length >= 2, 'both sync and async failures should be logged');
+
+    a.stop(); b.stop();
+  });
 });
 
 describe('direct fire-and-forget', () => {
@@ -481,6 +517,79 @@ describe('per-peer keys', () => {
     assert.ok(noAckFired,                    'client emits no-ack diagnostic');
     c.stop();
   });
+
+  test('static secret-map ignores prototype-polluted properties', async () => {
+    Object.prototype.evilKind = 'attacker-controlled-key';
+    try {
+      const c = new LinkClient({
+        url: `ws://127.0.0.1:${PP_PORT}`,
+        secret: 'attacker-controlled-key', kind: 'evilKind',
+        logger: null, helloAckDiagnosticMs: 0,
+        reconnectInitialMs: 100, reconnectMaxMs: 100,
+      });
+      await assert.rejects(c.ready({ timeoutMs: 200 }), /timed out/);
+      c.stop();
+    } finally {
+      delete Object.prototype.evilKind;
+    }
+  });
+});
+
+describe('hello sanitization', () => {
+  test('hub rejects hello with spaces in kind (KIND_PATTERN)', async () => {
+    const c = new LinkClient({
+      url: URL, secret: SECRET, kind: 'kind with spaces',
+      logger: null, helloAckDiagnosticMs: 0,
+      reconnectInitialMs: 50, reconnectMaxMs: 50,
+    });
+    const events = [];
+    server.hub.on('protocol-error', (i) => events.push(i));
+    c.start();
+    await tick(150);
+    const badHello = events.find((e) => e.reason === 'bad-hello');
+    assert.ok(badHello, 'expected bad-hello protocol-error');
+    assert.strictEqual(badHello.detail, 'invalid-kind');
+    c.stop();
+  });
+
+  test('hub rejects hello with control chars in kind', async () => {
+    const c = new LinkClient({
+      url: URL, secret: SECRET, kind: 'worker\nINJECTED',
+      logger: null, helloAckDiagnosticMs: 0,
+      reconnectInitialMs: 50, reconnectMaxMs: 50,
+    });
+    const events = [];
+    server.hub.on('protocol-error', (i) => events.push(i));
+    c.start();
+    await tick(150);
+    assert.ok(events.find((e) => e.reason === 'bad-hello' && e.detail === 'invalid-kind'));
+    c.stop();
+  });
+
+  test('hub rejects hello with empty kind (missing-kind detail)', async () => {
+    const c = await readyClient({ kind: 'kind-empty-probe' });
+    const events = [];
+    server.hub.on('protocol-error', (i) => events.push(i));
+    const helloMsg = makeMsg(SECRET, {
+      id: 'forged-empty-hello', type: 'hello',
+      from: null, to: null, data: { kind: '', name: 'x' },
+    });
+    const ws = new (require('ws'))(URL);
+    await new Promise((r) => ws.on('open', r));
+    ws.send(JSON.stringify(helloMsg));
+    await tick(100);
+    assert.ok(events.find((e) => e.reason === 'bad-hello' && e.detail === 'missing-kind'));
+    try { ws.close(); } catch {}
+    c.stop();
+  });
+
+  test('valid kinds (alphanumeric, dot, underscore, hyphen) still connect', async () => {
+    for (const kind of ['worker', 'svc.api', 'sub_one', 'tier-1', 'a.b_c-d.0']) {
+      const c = await readyClient({ kind });
+      assert.ok(c.isReady(), `${kind} should connect`);
+      c.stop();
+    }
+  });
 });
 
 describe('hub protocol-error + statuses eviction', () => {
@@ -497,6 +606,79 @@ describe('hub protocol-error + statuses eviction', () => {
     assert.strictEqual(info.reason, 'bad-signature');
     assert.strictEqual(info.kind,   'pe-a');
     c.stop();
+  });
+
+  test('replay-id cache is partitioned by kind: two peers reusing an id do not collide', async () => {
+    const a = await readyClient({ kind: 'rid-a' });
+    const b = await readyClient({ kind: 'rid-b' });
+    const recv = await readyClient({ kind: 'rid-recv' });
+    let received = 0;
+    recv.subscribe('rid.test', () => { received += 1; });
+    await tick();
+
+    const sharedId = 'shared-id-not-a-uuid';
+    const aMsg = makeMsg(SECRET, {
+      id: sharedId, type: 'topic.message', from: 'rid-a',
+      data: { topic: 'rid.test', payload: { who: 'a' } },
+    });
+    const bMsg = makeMsg(SECRET, {
+      id: sharedId, type: 'topic.message', from: 'rid-b',
+      data: { topic: 'rid.test', payload: { who: 'b' } },
+    });
+    a.ws.send(JSON.stringify(aMsg));
+    b.ws.send(JSON.stringify(bMsg));
+    await tick(100);
+    assert.strictEqual(received, 2,
+      'both publishers should reach the subscriber - cache key is kind|id, not id');
+    a.stop(); b.stop(); recv.stop();
+  });
+
+  test('replay-id still detected within a single kind', async () => {
+    const a = await readyClient({ kind: 'rid-self' });
+    const recv = await readyClient({ kind: 'rid-self-recv' });
+    let received = 0;
+    recv.subscribe('rid.self', () => { received += 1; });
+    await tick();
+
+    const sharedId = 'self-replay-id';
+    const m = makeMsg(SECRET, {
+      id: sharedId, type: 'topic.message', from: 'rid-self',
+      data: { topic: 'rid.self', payload: { x: 1 } },
+    });
+    a.ws.send(JSON.stringify(m));
+    await tick(50);
+    a.ws.send(JSON.stringify(m));
+    await tick(100);
+    assert.strictEqual(received, 1, 'second send from same kind with same id is a replay');
+    a.stop(); recv.stop();
+  });
+
+  test('client replay-id cache is partitioned by sender for forwarded rpc.request', async () => {
+    const a = await readyClient({ kind: 'crid-a' });
+    const b = await readyClient({ kind: 'crid-b' });
+    let invocations = 0;
+    const c = await readyClient({
+      kind: 'crid-c',
+      rpcHandlers: {
+        'shared': async () => { invocations += 1; return { ok: true }; },
+      },
+    });
+
+    const sharedId = 'shared-rpc-id-not-uuid';
+    const aMsg = makeMsg(SECRET, {
+      id: sharedId, type: 'rpc.request', from: 'crid-a', to: 'crid-c',
+      data: { rpcType: 'shared', rpcData: { who: 'a' } },
+    });
+    const bMsg = makeMsg(SECRET, {
+      id: sharedId, type: 'rpc.request', from: 'crid-b', to: 'crid-c',
+      data: { rpcType: 'shared', rpcData: { who: 'b' } },
+    });
+    a.ws.send(JSON.stringify(aMsg));
+    b.ws.send(JSON.stringify(bMsg));
+    await tick(150);
+    assert.strictEqual(invocations, 2,
+      "both forwarded RPCs should reach c's handler - cache key is from|id, not id");
+    a.stop(); b.stop(); c.stop();
   });
 
   test('hub statuses are evicted when a peer disconnects', async () => {
@@ -538,12 +720,83 @@ describe('hubFeatures reset on reconnect', () => {
     const c = await readyClient({ kind: 'hf-a' });
     assert.ok(Array.isArray(c.hubFeatures));
     c.stop();
-    assert.deepStrictEqual(c.hubFeatures, ['topics', 'direct'],
-      'just after stop, hubFeatures still holds the last value (close handler does not clear it)');
+    assert.strictEqual(c.hubFeatures, null,
+      'stop() clears hubFeatures so a later start() against a possibly-different hub starts fresh');
     const fresh = new LinkClient({ url: URL, secret: SECRET, kind: 'hf-b', logger: null });
     assert.strictEqual(fresh.hubFeatures, null, 'fresh client has null until ready');
     await fresh.ready({ timeoutMs: 2000 });
     assert.ok(Array.isArray(fresh.hubFeatures));
     fresh.stop();
+  });
+});
+
+describe('createHubServer: topology-leak warning', () => {
+  function makeRecordingLogger() {
+    const logs = [];
+    return {
+      logs,
+      log:  (tag, ...args) => logs.push({ level: 'log',  tag, msg: args.join(' ') }),
+      warn: (tag, ...args) => logs.push({ level: 'warn', tag, msg: args.join(' ') }),
+    };
+  }
+
+  test('warns when /state enabled and binding 0.0.0.0 without explicit opt-in', async () => {
+    const lg = makeRecordingLogger();
+    const s = createHubServer({
+      secret: SECRET, port: 18810, logger: lg, handleSignals: false,
+    });
+    await s.start();
+    try {
+      const fired = lg.logs.some((e) => e.level === 'warn' && /\/state/.test(e.msg));
+      assert.ok(fired, 'expected topology-leak warning for default 0.0.0.0 + /state');
+    } finally {
+      await s.stop();
+    }
+  });
+
+  test('does NOT warn when host is 127.0.0.1', async () => {
+    const lg = makeRecordingLogger();
+    const s = createHubServer({
+      secret: SECRET, port: 18811, host: '127.0.0.1',
+      logger: lg, handleSignals: false,
+    });
+    await s.start();
+    try {
+      const fired = lg.logs.some((e) => e.level === 'warn' && /\/state/.test(e.msg));
+      assert.ok(!fired, 'no warning expected when bound to loopback');
+    } finally {
+      await s.stop();
+    }
+  });
+
+  test('does NOT warn when /state is disabled', async () => {
+    const lg = makeRecordingLogger();
+    const s = createHubServer({
+      secret: SECRET, port: 18812, enableStateRoute: false,
+      logger: lg, handleSignals: false,
+    });
+    await s.start();
+    try {
+      const fired = lg.logs.some((e) => e.level === 'warn' && /\/state/.test(e.msg));
+      assert.ok(!fired, 'no warning expected when /state is disabled');
+    } finally {
+      await s.stop();
+    }
+  });
+
+  test('does NOT warn when both host and enableStateRoute are explicit (acknowledged exposure)', async () => {
+    const lg = makeRecordingLogger();
+    const s = createHubServer({
+      secret: SECRET, port: 18813,
+      host: '0.0.0.0', enableStateRoute: true,
+      logger: lg, handleSignals: false,
+    });
+    await s.start();
+    try {
+      const fired = lg.logs.some((e) => e.level === 'warn' && /\/state/.test(e.msg));
+      assert.ok(!fired, 'explicit opt-in suppresses the warning');
+    } finally {
+      await s.stop();
+    }
   });
 });

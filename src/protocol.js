@@ -6,13 +6,6 @@ const TOPIC_MAX_LENGTH  = 256;
 const DEFAULT_HASH_ALGO = 'sha256';
 const TOPIC_PATTERN     = /^[a-zA-Z0-9._\-]+$/;
 
-/**
- * Compute the hex HMAC of `msg` (excluding `msg.sig`). Internally calls
- * `stableStringify` to produce a deterministic byte sequence regardless of
- * key order - so the leaves of `msg` (anywhere inside `data`) must be
- * `JSON.stringify`-able. `BigInt`, circular references, and other
- * JSON-incompatible values throw.
- */
 function sign(secret, msg, algo = DEFAULT_HASH_ALGO) {
   const clone = { ...msg };
   delete clone.sig;
@@ -35,20 +28,6 @@ function verify(secret, msg, algo = DEFAULT_HASH_ALGO) {
   }
 }
 
-/**
- * Build a fully-formed signed envelope. `id` is the only field with no
- * default - supply a fresh value per message (UUIDs are recommended; the
- * recent-id replay cache assumes uniqueness within `replayWindowMs`). `v`
- * defaults to `PROTOCOL_VERSION`, `ts` to `Date.now()`, `from`/`to` to
- * `null`. `data` is deep-cloned via `structuredClone` so the caller may
- * freely mutate the input afterward.
- *
- * `data` (and the rest of the envelope) must satisfy two layered
- * constraints: every value must be `structuredClone`-compatible (so the
- * clone succeeds), AND every value must be `JSON.stringify`-able once
- * cloned (so signing succeeds). `BigInt` for example clones fine but
- * throws on stringify; functions throw on clone.
- */
 function makeMsg(secret, parts, algo = DEFAULT_HASH_ALGO) {
   const {
     v = PROTOCOL_VERSION,
@@ -67,19 +46,6 @@ function isValidTopic(topic) {
     && TOPIC_PATTERN.test(topic);
 }
 
-/**
- * Canonical JSON serialization for HMAC signing. Matches `JSON.stringify`
- * semantics on the wire (drops `undefined`/function/symbol values, calls
- * `toJSON()` if present so `Date` becomes its ISO string, throws on cycles)
- * but additionally sorts object keys recursively so that two
- * semantically-equal envelopes produce the same bytes regardless of property
- * insertion order.
- *
- * Critical: the receiver runs `JSON.parse(raw)` then signs again with this
- * function, so this function MUST agree with `JSON.stringify` on what gets
- * included or stripped - otherwise the same envelope produces two different
- * signatures across the wire.
- */
 function stableStringify(value) {
   const seen = new WeakSet();
 
@@ -101,10 +67,13 @@ function stableStringify(value) {
     seen.add(v);
 
     if (Array.isArray(v)) {
-      const out = `[${v.map((item) => {
-        const s = stringify(item);
-        return s === undefined ? 'null' : s;
-      }).join(',')}]`;
+      const items = [];
+      for (let i = 0; i < v.length; i++) {
+        const s = stringify(v[i]);
+        items.push(s === undefined ? 'null' : s);
+      }
+
+      const out = `[${items.join(',')}]`;
 
       seen.delete(v);
       return out;

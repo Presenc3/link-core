@@ -39,6 +39,23 @@ test('stableStringify handles primitives and null', () => {
   assert.strictEqual(stableStringify([1, 2]), '[1,2]');
 });
 
+test('stableStringify treats sparse-array holes as null (matches JSON.stringify)', () => {
+  const arr = [1, , 3];
+
+  assert.strictEqual(stableStringify(arr), '[1,null,3]');
+  assert.strictEqual(stableStringify(arr), JSON.stringify(arr));
+
+  const allHoles = new Array(3);
+  assert.strictEqual(stableStringify(allHoles), '[null,null,null]');
+  assert.strictEqual(stableStringify(allHoles), JSON.stringify(allHoles));
+});
+
+test('signature stable across the JSON round-trip for sparse arrays', () => {
+  const original = makeMsg(SECRET, { id: 'a', type: 't', data: { arr: [1, , 3] } });
+  const onWire = JSON.parse(JSON.stringify(original));
+  assert.strictEqual(verify(SECRET, onWire), true);
+});
+
 test('sign + verify roundtrips on a valid envelope', () => {
   const msg = makeMsg(SECRET, { id: 'a', type: 't', data: { x: 1 } });
   assert.strictEqual(verify(SECRET, msg), true);

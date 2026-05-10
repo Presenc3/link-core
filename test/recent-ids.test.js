@@ -52,6 +52,17 @@ test('LRU evicts oldest when at maxCount', () => {
   assert.strictEqual(r.has('d'), true);
 });
 
+test('re-adding moves an entry to the back of the LRU (true LRU, not FIFO)', () => {
+  const r = new RecentIds({ maxAgeMs: 60_000, maxCount: 3 });
+  r.add('a'); r.add('b'); r.add('c');
+  r.add('a');
+  r.add('d');
+  assert.strictEqual(r.has('a'), true,  '"a" should still be present after re-add + eviction');
+  assert.strictEqual(r.has('b'), false, '"b" should now be the oldest and evicted');
+  assert.strictEqual(r.has('c'), true);
+  assert.strictEqual(r.has('d'), true);
+});
+
 test('expiry sweep on add() reclaims room before LRU', async () => {
   const r = new RecentIds({ maxAgeMs: 30, maxCount: 3 });
   r.add('a'); r.add('b');

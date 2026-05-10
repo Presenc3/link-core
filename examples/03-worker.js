@@ -12,22 +12,22 @@
 **/
 
 const {
-  LinkClient,
-  RpcDisconnectError, RpcTimeoutError, RpcRemoteError,
+  LinkClient,      RpcDisconnectError,
+  RpcTimeoutError, RpcRemoteError,
 } = require('../src/index.js');
 
+const fn = '[ Worker ]';
 const NAME = `worker-${process.pid}`;
 
-let dbPassword = null;
-let load       = 0;
+let dbPassword = null, load = 0;
 
 const link = new LinkClient({
-  url:    process.env.LINK_URL        || 'ws://localhost:8080',
-  secret: process.env.LINK_KEY_WORKER || 'dev-worker-key',
-  kind:   'worker',
-  name:   NAME,
+  url    :   process.env.LINK_URL        || 'ws://localhost:8080',
+  secret :   process.env.LINK_KEY_WORKER || 'dev-worker-key',
+  kind   :   'worker',
+  name   :   NAME,
 
-  // Pushed to the hub on connect and every statusIntervalMs.
+  // Pushed to the hub on connect and every statusIntervalMs
   makeStatus: () => ({
     load,
     status: load > 0 ? 'busy' : 'idle',
@@ -36,7 +36,7 @@ const link = new LinkClient({
 
   rpcHandlers: {
     'job.run': async ({ jobId, payload } = {}, msg) => {
-      console.log(`[worker] job.run #${jobId} from ${msg.from}`);
+      console.log(`${fn} job.run #${jobId} from ${msg.from}`);
       load += 1;
 
       try {
@@ -45,16 +45,14 @@ const link = new LinkClient({
         for (let i = 1; i <= total; i++) {
           await new Promise((r) => setTimeout(r, 200));
 
-          // Progress is fire-and-forget;
-          // link.send returns true/false; a throw means the link itself
-          // is no longer ready (which we report and bail).
+          // Progress is fire-and-forget. link.send returns true/false; a throw means the link itself is no longer ready (which we report and bail)
           try {
             link.send(msg.from, 'job.progress', {
               jobId,
               pct:  Math.round((i / total) * 100),
             });
           } catch (e) {
-            console.warn(`[worker] could not send progress for #${jobId}: ${e.message}`);
+            console.warn(`${fn} could not send progress for #${jobId}: ${e.message}`);
             break;
           }
         }
@@ -67,7 +65,7 @@ const link = new LinkClient({
   },
 });
 
-// Helper: wait until a peer of `kind` shows up in the latest peers.update.
+// Helper: wait until a peer of `kind` shows up in the latest peers.update
 async function waitForPeer(kind, timeoutMs = 30_000) {
   if (link.getPeers().some((p) => p.kind === kind)) return;
 
@@ -81,7 +79,7 @@ async function waitForPeer(kind, timeoutMs = 30_000) {
     try {
       await link.waitFor('peer.connect', { timeoutMs: Math.min(remaining, 5_000) });
     } catch {
-      // No connect this tick; loop and check again.
+      // No connect this tick; loop and check again
     }
   }
 }
@@ -99,18 +97,16 @@ async function fetchSecret(name, { tries = 5 } = {}) {
 
       if (i === tries) throw e;
 
-      console.log(`[worker] secrets.get(${name}) attempt ${i} failed (${e.code || e.message}), retrying…`);
+      console.log(`${fn} secrets.get(${name}) attempt ${i} failed (${e.code || e.message}), retrying…`);
 
       await new Promise((r) => setTimeout(r, 500 * i));
     }
   }
 }
 
-link.on('rejected', ({ reason }) => console.error(`[worker] hub rejected hello: ${reason}`));
-
-link.on('protocol-error', ({ reason }) => console.warn(`[worker] protocol-error: ${reason}`));
-
-link.on('ready', () => console.log(`[worker] ready as ${NAME}`));
+link.on('ready', () => console.log(`${fn} ready as ${NAME}`));
+link.on('rejected', ({ reason }) => console.error(`${fn} hub rejected hello: ${reason}`));
+link.on('protocol-error', ({ reason }) => console.warn(`${fn} protocol-error: ${reason}`));
 
 (async () => {
   await link.ready({ timeoutMs: 10_000 });
@@ -119,19 +115,19 @@ link.on('ready', () => console.log(`[worker] ready as ${NAME}`));
   try {
     dbPassword = await fetchSecret('db-password');
 
-    console.log(`[worker] got db-password from vault (length=${dbPassword.length})`);
+    console.log(`${fn} got db-password from vault (length=${dbPassword.length})`);
   } catch (e) {
-    if (e instanceof RpcDisconnectError) console.warn('[worker] disconnected during bootstrap - will retry on next reconnect');
-    else if (e instanceof RpcTimeoutError) console.warn('[worker] vault did not respond in time');
-    else console.warn(`[worker] could not fetch db-password: ${e.message}`);
+    if (e instanceof RpcDisconnectError) console.warn(`${fn} disconnected during bootstrap - will retry on next reconnect`);
+    else if (e instanceof RpcTimeoutError) console.warn(`${fn} vault did not respond in time`);
+    else console.warn(`${fn} could not fetch db-password: ${e.message}`);
   }
 
-  console.log('[worker] ready for work');
+  console.log(`${fn} ready for work`);
 })().catch((e) => {
-  console.error('[worker]', e);
+  console.error(`${fn} error: `, e);
   process.exit(1);
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { console.log(`[worker] ${sig}, stopping`); link.stop(); process.exit(0); });
+  process.on(sig, () => { console.log(`${fn} ${sig}, stopping`); link.stop(); process.exit(0); });
 }

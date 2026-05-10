@@ -41,7 +41,6 @@ function createHub({
 
   const hub = new EventEmitter();
 
-  // === State ============================================================
   const clients        = new Map();
   const statuses       = new Map();
   const subscriptions  = new Map();
@@ -51,7 +50,6 @@ function createHub({
     ? new RecentIds({ maxAgeMs: replayWindowMs, maxCount: maxRecentIds })
     : null;
 
-  // === Helpers ==========================================================
   function emitSafe(event, payload) {
     try { hub.emit(event, payload); }
     catch (e) { log.warn(TAG, `listener for '${event}' threw:`, e?.message || e); }
@@ -133,7 +131,6 @@ function createHub({
     }
   }
 
-  // === Server-side RPC ==================================================
   const builtinRpcs = {
     'link.topic.list': ({ topic } = {}) => {
       if (typeof topic === 'string' && topic.length > 0) {
@@ -156,7 +153,6 @@ function createHub({
     return handler(rpcData, msg);
   }
 
-  // === Pre-hello tracking ===============================================
   function trackPending(ws, ip) {
     if (helloTimeoutMs <= 0) return;
 
@@ -183,7 +179,6 @@ function createHub({
     pendingSockets.delete(ws);
   }
 
-  // === Per-socket attach ================================================
   function attach(ws, req) {
     const ip = req?.socket?.remoteAddress;
     log.log(TAG, `ws connection from ${ip}`);
@@ -231,7 +226,6 @@ function createHub({
     });
   }
 
-  // === Keepalive ========================================================
   const keepalive = setInterval(() => {
     for (const [kind, c] of clients.entries()) {
       const ws = c.ws;
@@ -256,11 +250,11 @@ function createHub({
   }, keepaliveIntervalMs);
   keepalive.unref?.();
 
-  // === Shutdown =========================================================
   function stop() {
     clearInterval(keepalive);
-    for (const [, entry] of pendingSockets.entries()) {
+    for (const [ws, entry] of pendingSockets.entries()) {
       clearTimeout(entry.timer);
+      try { ws.close(1001, 'hub stopped'); } catch {}
     }
     pendingSockets.clear();
     for (const [, c] of clients.entries()) {

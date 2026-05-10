@@ -685,7 +685,7 @@ Properties:
 | `'disconnect'`     | `{ code?, reason, willReconnect, wasReady }`                         | WebSocket closed. `willReconnect` is `false` after `stop()` or after a hello rejection (default). `wasReady` indicates whether `'ready'` had fired during this connection. |
 | `'reconnecting'`   | `{ delayMs, attempt }`                                               | A reconnect attempt is scheduled.                                         |
 | `'ws-error'`       | `Error`                                                              | Underlying WebSocket error.                                               |
-| `'protocol-error'` | `{ reason, type?, msg?, size?, skew?, error? }`                      | A message was rejected. `reason` is one of `'parse-error'`, `'bad-signature'`, `'bad-version'`, `'replay-window'`, `'replay-id'`, `'oversize'`, `'no-ack'`. |
+| `'protocol-error'` | `{ reason, type?, msg?, size?, skew?, error? }`                      | A message was rejected. `reason` is one of `'parse-error'`, `'bad-signature'`, `'bad-version'`, `'replay-window'`, `'replay-id'`, `'missing-id'`, `'oversize'`, `'no-ack'`. |
 | `'backpressure'`   | `{ type, to?, rpcType?, bufferedAmount }`                            | A send was dropped (or an RPC rejected) because `ws.bufferedAmount` exceeded `maxBufferedBytes`. |
 | `'message'`        | `{ msg, raw }`                                                       | Power-user firehose: every verified message post-checks.                  |
 | `'peer.connect'`   | `peer` (PeerInfo)                                                    | A new peer kind appeared in the latest `peers.update`.                    |
@@ -759,7 +759,7 @@ The returned `EventEmitter` emits the following events. All are observability-on
 | `backpressure`            | `{ kind, type, to?, bufferedAmount, maxBufferedBytes }`                  | A send was dropped due to per-peer buffer cap.             |
 | `message`                 | `{ from, msg }`                                                          | Power-user firehose: every verified message.               |
 
-`protocol-error` reasons include: `parse-error`, `bad-signature`, `bad-version`, `replay-window`, `replay-id`, `oversize`, `bad-hello`, `unknown-kind`, `pre-hello-message`, `invalid-topic`.
+`protocol-error` reasons include: `parse-error`, `bad-signature`, `bad-version`, `replay-window`, `replay-id`, `missing-id`, `oversize`, `bad-hello`, `duplicate-hello`, `unknown-kind`, `pre-hello-message`, `invalid-topic`.
 
 Example use: a connection-counter for Prometheus, a Slack alert when a particular kind drops, an audit log of every RPC:
 
@@ -788,7 +788,7 @@ A batteries-included wrapper around `createHub`. Creates and manages the HTTP se
 | `path`              | `string`              | -             | If set, only handle WebSocket upgrades at this path (e.g. `'/link'`). Otherwise all upgrades are handled. |
 | `routes`            | `object`              | `{}`          | Map of `pathname → (req, res) => void \| Promise<void>`. User routes win over the defaults below. |
 | `enableHealthRoute` | `boolean`             | `true`        | Adds `GET /health` returning `{ ok, now, hub: hub.health() }`. Ignored when `server` is provided. |
-| `enableStateRoute`  | `boolean`             | `true`        | Adds `GET /state` returning `{ ...hub.getState(), ...extraState() }` pretty-printed. Ignored when `server` is provided. |
+| `enableStateRoute`  | `boolean`             | `true`        | Adds `GET /state` returning `{ ...hub.getState(), ...extraState() }` pretty-printed. Ignored when `server` is provided. **Note:** binding `0.0.0.0` with `/state` enabled exposes peer kinds, hello payloads, and last-known statuses. The hub logs a warning at startup unless you explicitly set both `host` and `enableStateRoute`; recommended productions are `enableStateRoute: false` or `host: '127.0.0.1'` (with /state behind a reverse proxy or ssh tunnel). |
 | `extraState`        | `function`            | -             | `() => object \| Promise<object>`. Merged into `/state` after `hub.getState()`. Use this for app-specific state like `{ kvKeys: 42 }`. |
 | `handleSignals`     | `boolean`             | `true`        | Install `SIGINT`/`SIGTERM` handlers that call `stop()`. Set to `false` if you already manage signals. |
 | `signals`           | `string[]`            | `['SIGINT','SIGTERM']` | Which signals to handle when `handleSignals` is `true`.                                  |
@@ -935,7 +935,7 @@ Messages with a missing or invalid `sig` are silently dropped on both sides. The
 
 ### Client
 
-- **Reconnection:** exponential backoff starting at `reconnectInitialMs` (default 1 s), growing by `reconnectGrowth` (default 1.5×) per attempt, capped at `reconnectMaxMs` (default 10 s). Backoff resets only on the `'ready'` transition - connections that open but never reach `ready` (e.g. secret mismatch leading to a hub-side close) keep growing the backoff across attempts.
+- **Reconnection:** exponential backoff starting at `reconnectInitialMs` (default 1 s), growing by `reconnectGrowth` (default 1.5×) per attempt, capped at `reconnectMaxMs` (default 10 s), with `reconnectJitter` (default 0.5 = ±25%) applied to each scheduled delay so synchronized drops (e.g. after a hub restart) don't all retry at the same instant. Set `reconnectJitter: 0` to disable. Backoff resets only on the `'ready'` transition - connections that open but never reach `ready` (e.g. secret mismatch leading to a hub-side close) keep growing the backoff across attempts.
 - **`start()`/`stop()` race:** `start()` recognizes `OPEN`, `CONNECTING`, *and* `CLOSING`/`CLOSED` socket states; if there's an old closing socket, its listeners are detached so its eventual close can't interfere with the new connection. `stop()` does the same up front. *(since v0.4.0)*
 - **Status cadence:** `makeStatus()` (if provided) fires once on connect and then every `statusIntervalMs` (default 10 s).
 - **RPC timeouts:** default `defaultRpcTimeoutMs` (5 s). Timed-out RPCs reject with `RpcTimeoutError` (`err.code === 'RPC_TIMEOUT'`, message `RPC timeout after <ms>ms: <to>:<rpcType>`) and emit `'rpc.timeout'`. Late responses are logged and discarded.

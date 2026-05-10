@@ -6,12 +6,14 @@ const WS_OPEN        = 1;
 const HELLO_KIND_MAX = 256;
 const HELLO_NAME_MAX = 256;
 
+const KIND_PATTERN = /^[a-zA-Z0-9._-]+$/;
+
 const DEFAULT_MAX_RECENT_IDS        = 10_000;
 const DEFAULT_HELLO_TIMEOUT_MS      = 10_000;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
 const DEFAULT_MAX_MESSAGE_BYTES     = 1_048_576;
 const DEFAULT_REPLAY_WINDOW_MS      = 5 * 60_000;
-const DEFAULT_MAX_BUFFERED_BYTES    = 4 * 1_048_576; // 4 MiB
+const DEFAULT_MAX_BUFFERED_BYTES    = 4 * 1_048_576;
 
 const HUB_FEATURES = Object.freeze(['topics', 'direct']);
 
@@ -19,6 +21,7 @@ module.exports = {
   TAG,
   WS_OPEN,
   HUB_FEATURES,
+  KIND_PATTERN,
   HELLO_KIND_MAX,
   HELLO_NAME_MAX,
   DEFAULT_MAX_RECENT_IDS,

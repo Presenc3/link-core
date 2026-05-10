@@ -1,34 +1,16 @@
 'use strict';
 
-const { verify, PROTOCOL_VERSION } = require('../protocol.js');
-
-const {
-  RpcRemoteError, RpcDisconnectError,
-} = require('../util/errors.js');
-
 const { TAG } = require('./constants.js');
+const { verify, PROTOCOL_VERSION } = require('../protocol.js');
+const { RpcRemoteError, RpcDisconnectError } = require('../util/errors.js');
 
-/**
- * Handle a single raw frame from the hub. Runs the six-step verification
- * chain (size, parse, signature, version, replay window, replay id), then
- * does first-verified-message bookkeeping (clearing the hello-ack diagnostic
- * timer, transitioning to ready, replaying subscriptions, starting the
- * status push timer), then dispatches by `msg.type`.
- *
- * Pulled out of `LinkClient._connect()`'s `ws.on('message', ...)` so the
- * class file isn't dominated by ~200 lines of inline message handling.
- * Mutates the client via documented internal fields - this is "the same
- * code, just in a different file".
- */
 function handleInboundMessage(client, raw) {
-  // 1. Defensive size check
   if (raw.length > client.maxMessageBytes) {
     client.log.warn(TAG, `dropped: message too large (${raw.length} bytes > ${client.maxMessageBytes})`);
     client.emit('protocol-error', { reason: 'oversize', size: raw.length });
     return;
   }
 
-  // 2. Parse
   let msg;
   try { msg = JSON.parse(String(raw)); }
   catch (e) {
@@ -37,7 +19,12 @@ function handleInboundMessage(client, raw) {
     return;
   }
 
-  // 3. Signature
+  if (typeof msg?.id !== 'string' || msg.id.length === 0) {
+    client.log.warn(TAG, `dropped: missing or empty id (type=${msg?.type})`);
+    client.emit('protocol-error', { reason: 'missing-id', type: msg?.type });
+    return;
+  }
+
   if (!verify(client.secret, msg, client.hashAlgo)) {
     if (!client._verifiedAny) {
       client.log.warn(TAG, `signature verification failed before any verified message - likely secret mismatch with the hub (type=${msg?.type})`);
@@ -48,14 +35,12 @@ function handleInboundMessage(client, raw) {
     return;
   }
 
-  // 4. Protocol version
   if (msg.v !== PROTOCOL_VERSION) {
     client.log.warn(TAG, `dropped message: unsupported protocol version v=${msg?.v} (expected ${PROTOCOL_VERSION}, type=${msg?.type})`);
     client.emit('protocol-error', { reason: 'bad-version', type: msg?.type, msg });
     return;
   }
 
-  // 5. Replay: timestamp window
   if (client.replayWindowMs > 0) {
     const skew = Math.abs(Date.now() - (typeof msg.ts === 'number' ? msg.ts : 0));
 
@@ -66,18 +51,19 @@ function handleInboundMessage(client, raw) {
     }
   }
 
-  // 6. Replay: id duplicate (responses exempt)
-  if (client.recentIds && msg.id && msg.type !== 'rpc.response') {
-    if (client.recentIds.has(msg.id)) {
-      client.log.warn(TAG, `dropped message: replay of id ${String(msg.id).slice(0, 8)} (type=${msg?.type})`);
+  if (client.recentIds && msg.type !== 'rpc.response') {
+    const senderKind = msg.from || 'server';
+    const cacheKey   = `${senderKind}|${msg.id}`;
+
+    if (client.recentIds.has(cacheKey)) {
+      client.log.warn(TAG, `dropped message: replay of id ${String(msg.id).slice(0, 8)} from ${senderKind} (type=${msg?.type})`);
       client.emit('protocol-error', { reason: 'replay-id', type: msg?.type, msg });
       return;
     }
 
-    client.recentIds.add(msg.id);
+    client.recentIds.add(cacheKey);
   }
 
-  // First-verified-message bookkeeping
   if (!client._verifiedAny) {
     client._verifiedAny = true;
     if (client.helloAckTimer) {
@@ -197,11 +183,16 @@ function handleInboundMessage(client, raw) {
     case 'topic.message': {
       const { topic, payload } = msg.data || {};
       if (typeof topic !== 'string' || !topic) return;
+
       const handlers = client._subscriptions.get(topic);
       if (!handlers || handlers.size === 0) return;
+
       for (const h of handlers) {
         try {
-          h(payload, msg);
+          const r = h(payload, msg);
+          if (r && typeof r.then === 'function') {
+            r.catch((e) => client.log.warn(TAG, `topic handler for '${topic}' threw:`, e?.message || e));
+          }
         } catch (e) {
           client.log.warn(TAG, `topic handler for '${topic}' threw:`, e?.message || e);
         }
@@ -213,38 +204,37 @@ function handleInboundMessage(client, raw) {
       const directType = msg.data?.directType;
       const directData = msg.data?.directData;
       if (typeof directType !== 'string' || !directType) return;
+
       client.emit('direct', { from: msg.from, type: directType, data: directData, msg });
       return;
     }
   }
 }
 
-/**
- * Handle the `ws.on('close')` event. Clears timers, fails any in-flight
- * RPCs with `RpcDisconnectError`, fires `'disconnect'`, and schedules a
- * reconnect if the client wasn't explicitly stopped.
- *
- * Also extracted from `_connect()` to keep the class file readable.
- */
 function handleClose(client, code, reason) {
   if (client.statusTimer)   { clearInterval(client.statusTimer); client.statusTimer = null; }
   if (client.helloAckTimer) { clearTimeout(client.helloAckTimer); client.helloAckTimer = null; }
 
   const wasReady = client._ready;
+
   client._ready = false;
+  client.hubFeatures = null;
 
   if (!client._stopped && client.pending.size > 0) {
     for (const [, p] of client.pending) {
       clearTimeout(p.timeout);
       if (p.cleanupAbort) p.cleanupAbort();
+
       const err = new RpcDisconnectError(
         'Link disconnected before RPC completed',
         { to: p.to, rpcType: p.rpcType, id: p.id },
       );
+
       p.reject(err);
       client.emit('rpc.disconnect', { id: p.id, to: p.to, rpcType: p.rpcType });
       client._emitRpcComplete(p, false, 'disconnect', err);
     }
+
     client.pending.clear();
   }
 
@@ -260,7 +250,9 @@ function handleClose(client, code, reason) {
   client.log.log(TAG, `disconnected (${client.kind}), reconnecting in ${Math.round(client.reconnectMs)}ms…`);
 
   client._reconnectAttempt += 1;
-  const delayMs = client.reconnectMs;
+  const j       = client.reconnectJitter;
+  const baseMs  = client.reconnectMs;
+  const delayMs = Math.max(0, baseMs * (1 - j / 2 + Math.random() * j));
   const attempt = client._reconnectAttempt;
   client.emit('reconnecting', { delayMs, attempt });
 
@@ -268,7 +260,7 @@ function handleClose(client, code, reason) {
     client.reconnectTimer = null;
     client.reconnectMs = Math.min(client.reconnectMs * client.reconnectGrowth, client.reconnectMaxMs);
     client._connect();
-  }, client.reconnectMs);
+  }, delayMs);
 }
 
 module.exports = { handleInboundMessage, handleClose };
