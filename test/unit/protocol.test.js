@@ -7,7 +7,7 @@ const {
   sign, verify, makeMsg, stableStringify,
   isValidTopic, assertValidTopic,
   PROTOCOL_VERSION, TOPIC_MAX_LENGTH, DEFAULT_HASH_ALGO,
-} = require('../src/index.js');
+} = require('../../src/index.js');
 
 const SECRET = 'shared-test-secret';
 

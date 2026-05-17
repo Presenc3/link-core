@@ -1,3 +1,5 @@
+'use strict';
+
 const noopLogger = { log: () => {}, warn: () => {} };
 
 const consoleLogger = {

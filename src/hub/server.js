@@ -4,7 +4,9 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const { createHub } = require('./index.js');
-const { noopLogger, consoleLogger } = require('../util/log.js');
+const { DEFAULT_MAX_MESSAGE_BYTES } = require('./constants.js');
+const { noopLogger, consoleLogger } = require('../internal/logger.js');
+const { positiveFinite, nonNegFinite } = require('../internal/options.js');
 
 const TAG = 'link-core:hub-server';
 
@@ -14,13 +16,14 @@ const DEFAULT_HOST = '0.0.0.0';
 
 const DEFAULT_DRAIN_DELAY_MS      = 250;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_MESSAGE_BYTES   = 1_048_576;
 
 function pickPath(url) {
   if (typeof url !== 'string') return '/';
 
   const q = url.indexOf('?');
-  return q === -1 ? url : url.slice(0, q);
+  const noQuery = q === -1 ? url : url.slice(0, q);
+
+  return noQuery.replace(/\/+$/, '') || '/';
 }
 
 function createHubServer(opts = {}) {
@@ -30,64 +33,58 @@ function createHubServer(opts = {}) {
 
     path: wsPath,
     host = DEFAULT_HOST,
-    port = DEFAULT_PORT,
     server: existingServer = null,
 
     extraState,
     routes = {},
     enableHealthRoute = true,
-    enableStateRoute  = true,
+    enableStateRoute  = false,
 
     onShutdown,
-    handleSignals     = true,
-    signals           = ['SIGINT', 'SIGTERM'],
-    drainDelayMs      = DEFAULT_DRAIN_DELAY_MS,
-    shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
-
-    keepaliveIntervalMs,
-    replayWindowMs,
-    maxRecentIds,
-    maxMessageBytes = DEFAULT_MAX_MESSAGE_BYTES,
-    maxBufferedBytes,
-    helloTimeoutMs,
-    hashAlgo,
-    perMessageDeflate = false,
+    handleSignals = true,
+    signals = ['SIGINT', 'SIGTERM'],
 
     logger,
+    hashAlgo,
+    maxRecentIds,
+    replayWindowMs,
+    helloTimeoutMs,
+    maxBufferedBytes,
+    maxPendingSockets,
+    keepaliveIntervalMs,
+    perMessageDeflate = false
   } = opts;
 
   if (secret == null) throw new Error('createHubServer({ secret }) is required');
 
-  const log = logger === null ? noopLogger : (logger || consoleLogger);
-  const hostExplicit       = 'host'             in opts;
-  const stateRouteExplicit = 'enableStateRoute' in opts;
+  const port              = nonNegFinite(  opts.port,              DEFAULT_PORT,                'port');
+  const drainDelayMs      = nonNegFinite(  opts.drainDelayMs,      DEFAULT_DRAIN_DELAY_MS,      'drainDelayMs');
+  const maxMessageBytes   = positiveFinite(opts.maxMessageBytes,   DEFAULT_MAX_MESSAGE_BYTES,   'maxMessageBytes');
+  const shutdownTimeoutMs = positiveFinite(opts.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS, 'shutdownTimeoutMs');
 
-  if (
-    !existingServer
-    && enableStateRoute
-    && host === '0.0.0.0'
-    && !(hostExplicit && stateRouteExplicit)
-  ) {
-    log.warn(
-      TAG,
-      `binding 0.0.0.0 with /state enabled - the route exposes peer kinds, ` +
-      `hello payloads, and last-known statuses. To silence this warning, ` +
-      `pass either { enableStateRoute: false }, { host: '127.0.0.1' }, or ` +
-      `set both options explicitly to acknowledge the exposure.`,
+  const log = logger === null ? noopLogger : (logger || consoleLogger);
+
+  if (!existingServer && enableStateRoute && host === '0.0.0.0') {
+    log.warn(TAG,
+      `/state is enabled and bound to 0.0.0.0 - peer kinds, hello payloads, ` +
+      `and last-known statuses will be reachable to anyone who can reach `    +
+      `the port. If this is intentional (e.g. internal-network dashboard), `  +
+      `you can ignore this. Otherwise bind to 127.0.0.1 or disable /state.`,
     );
   }
 
   const hub = createHub({
     secret,
+    hashAlgo,
     rpcHandlers,
     logger: log,
-    keepaliveIntervalMs,
-    replayWindowMs,
     maxRecentIds,
+    replayWindowMs,
+    helloTimeoutMs,
     maxMessageBytes,
     maxBufferedBytes,
-    helloTimeoutMs,
-    hashAlgo,
+    maxPendingSockets,
+    keepaliveIntervalMs,
   });
 
   const ownsHttpServer = !existingServer;
@@ -112,19 +109,27 @@ function createHubServer(opts = {}) {
 
         if (enableStateRoute && pathOnly === '/state') {
           const hubState = hub.getState();
-          let extra = {};
+          let extra = null;
+
           if (typeof extraState === 'function') {
-            try { extra = (await extraState()) || {}; }
+            try { extra = await extraState(); }
             catch (e) { log.warn(TAG, 'extraState() threw:', e?.message || e); }
           }
 
           const merged = { ...hubState };
-          for (const k of Object.keys(extra)) {
-            if (k in hubState) {
-              log.warn(TAG, `extraState(): key '${k}' collides with hub state, ignoring`);
-            } else {
-              merged[k] = extra[k];
+
+          if (extra && typeof extra === 'object' && !Array.isArray(extra)) {
+            for (const k of Object.keys(extra)) {
+              if (k in hubState) {
+                log.warn(TAG, `extraState(): key '${k}' collides with hub state, ignoring`);
+              } else {
+                merged[k] = extra[k];
+              }
             }
+          } else if (extra != null) {
+            log.warn(TAG,
+              `extraState() returned non-object (typeof=${typeof extra}` +
+              `${Array.isArray(extra) ? ', array' : ''}); ignored`);
           }
 
           res.writeHead(200, { 'content-type': 'application/json' });
@@ -159,30 +164,33 @@ function createHubServer(opts = {}) {
   wss.on('error', (e) => log.warn(TAG, 'wss error:', e?.message || e));
 
   if (existingServer && !wsPath) {
-    log.warn(TAG, 'attached to user-provided http server without a `path` - every WebSocket upgrade on this server will be routed to the hub. Pass `path: \'/your-link-endpoint\'` to scope it.');
+    log.warn(TAG,
+      'attached to user-provided http server without a `path` - every WebSocket upgrade on this server will be routed to the hub. Pass `path: \'/your-link-endpoint\'` to scope it.'
+    );
   }
 
+  let stopPromise    = null;
   let started        = false;
   let stopping       = false;
-  let stopPromise    = null;
+  let stopped        = false;
   const signalHandlers = new Map();
 
   async function start() {
+    if (stopped) {
+      throw new Error('createHubServer is single-shot; call createHubServer() again to start a new server');
+    }
+    
     if (started) return;
 
     if (ownsHttpServer) {
-      try {
-        await new Promise((resolve, reject) => {
-          const onError     = (e) => { httpServer.off('listening', onListening); reject(e); };
-          const onListening = ()   => { httpServer.off('error',    onError);     resolve(); };
+      await new Promise((resolve, reject) => {
+        const onError     = (e) => { httpServer.off('listening', onListening); reject(e); };
+        const onListening = ()   => { httpServer.off('error',    onError);     resolve(); };
 
-          httpServer.once('error',     onError);
-          httpServer.once('listening', onListening);
-          httpServer.listen(port, host);
-        });
-      } catch (e) {
-        throw e;
-      }
+        httpServer.once('error',     onError);
+        httpServer.once('listening', onListening);
+        httpServer.listen(port, host);
+      });
 
       log.log(TAG, `listening on http://${host}:${port}`);
       log.log(TAG, `ws on ws://${host}:${port}${wsPath || ''}`);
@@ -204,17 +212,21 @@ function createHubServer(opts = {}) {
 
   async function stop(reason) {
     if (stopPromise) return stopPromise;
+    if (stopped) return Promise.resolve();
 
     if (!started) {
-      try { hub.stop(); } catch (e) { log.warn(TAG, 'hub.stop() error:', e?.message || e); }
-      return;
+      try { wss.close(); } catch (e) { log.warn(TAG, 'wss.close() error:',  e?.message || e); }
+      try { hub.stop();  } catch (e) { log.warn(TAG, 'hub.stop() error:',   e?.message || e); }
+
+      stopped = true;
+      return Promise.resolve();
     }
 
     stopping = true;
+    let timeoutHandle = null;
 
     log.log(TAG, `shutting down${reason ? ` (${reason})` : ''}...`);
 
-    let timeoutHandle = null;
     const timeout = new Promise((_, reject) => {
       timeoutHandle = setTimeout(
         () => reject(new Error(`shutdown timeout after ${shutdownTimeoutMs}ms`)),
@@ -272,11 +284,11 @@ function createHubServer(opts = {}) {
       } catch (e) {
         if (timeoutHandle) clearTimeout(timeoutHandle);
         log.warn(TAG, 'shutdown error:', e?.message || e);
-        
+
         throw e;
       } finally {
-        started     = false;
         stopping    = false;
+        stopped     = true;
         stopPromise = null;
       }
     })();
@@ -294,6 +306,7 @@ function createHubServer(opts = {}) {
     getState: () => hub.getState(),
     get isStarted()       { return started;        },
     get isStopping()      { return stopping;       },
+    get isStopped()       { return stopped;        },
     get isOwnHttpServer() { return ownsHttpServer; },
   };
 }

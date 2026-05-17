@@ -6,15 +6,55 @@ Shared WebSocket link protocol, client, and hub for inter-service communication.
 
 - **`LinkClient`** - a client that handles connection, reconnection, HMAC-signed messages, periodic status pushes, peer discovery, and request/response RPC.
 - **`createHub`** - an embeddable hub that routes messages between peers, tracks status, enforces one connection per peer kind, and lets you expose your own server-side RPCs. Transport-agnostic - you bring the HTTP/WebSocket server.
-- **`createHubServer`** - a batteries-included hub server that wraps `createHub` with an HTTP server, WebSocket server, default `/health` and `/state` routes, signal handling, and graceful shutdown. Use this when the hub *is* your service.
+- **`createHubServer`** - a batteries-included hub server that wraps `createHub` with an HTTP server, WebSocket server, a default `/health` route, an opt-in `/state` route, signal handling, and graceful shutdown. Use this when the hub *is* your service.
 
 The library is unopinionated about roles - every service uses `LinkClient`, and the meaning of "coordinator", "worker", "publisher", etc. is up to you.
+
+## Table of contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Connection lifecycle](#connection-lifecycle)
+- [A two-service example](#a-two-service-example)
+- [Custom server-side RPCs](#custom-server-side-rpcs)
+- [Pub/sub topics](#pubsub-topics)
+- [Directed fire-and-forget](#directed-fire-and-forget)
+- [Dynamic RPC handlers](#dynamic-rpc-handlers)
+- [Waiting for events](#waiting-for-events)
+- [Health snapshot](#health-snapshot)
+- [Errors](#errors)
+- [Aborting an in-flight RPC](#aborting-an-in-flight-rpc)
+- [Security & threat model](#security--threat-model)
+- [Per-peer keys](#per-peer-keys)
+- [Helpers](#helpers)
+  - [Logger - `createLogger`](#logger---createlogger)
+  - [Env - `num`, `bool`, `requireEnv`, `linkClientOptionsFromEnv`](#env---num-bool-requireenv-linkclientoptionsfromenv)
+  - [Observability - `attachClientObservability`, `attachHubObservability`](#observability---attachclientobservability-attachhubobservability)
+  - [RPC + topic helpers - `waitForPeer`, `rpcWithRetry`, `createSafePublisher`, `createSafeSend`](#rpc--topic-helpers---waitforpeer-rpcwithretry-createsafepublisher-createsafesend)
+  - [Lifecycle - `installProcessHandlers`, `createGracefulShutdown`](#lifecycle---installprocesshandlers-creategracefulshutdown)
+  - [Secrets - `loadSecrets`](#secrets---loadsecrets)
+  - [Event recorder - `createEventRecorder`](#event-recorder---createeventrecorder)
+- [API](#api)
+  - [`new LinkClient(options)`](#new-linkclientoptions)
+  - [`createHub(options)`](#createhuboptions)
+  - [`createHubServer(options)`](#createhubserveroptions)
+  - [Protocol helpers](#protocol-helpers)
+  - [Message types](#message-types)
+- [Message envelope](#message-envelope)
+- [Behavior notes](#behavior-notes)
+- [TypeScript](#typescript)
+- [What's new in v0.5](#whats-new-in-v05)
+- [What's new in v0.4](#whats-new-in-v04)
+- [Examples](#examples)
+- [License](#license)
 
 ## Install
 
 ```bash
 npm install @presenc3/link-core
 ```
+
+Requires Node.js **≥ 20**.
 
 `link-core` ships dual CommonJS + ESM entry points, with hand-written TypeScript declarations. All three styles work without configuration:
 
@@ -31,49 +71,11 @@ import { LinkClient, type LinkClientOptions } from '@presenc3/link-core';
 
 The package is marked `"sideEffects": false` so bundlers (webpack, Rollup, esbuild, Vite) can tree-shake unused exports.
 
-## What's new in v0.4
-
-This release is wire-compatible with v0.3.x (`PROTOCOL_VERSION` is still `1`) but adds a number of features and one minor surface rename. Most upgrades are drop-in. Highlights:
-
-- **`LinkBusClient` is now `LinkClient`.** The old name remains as a deprecated alias for the v0.4.x line and will be removed in v0.5.0. Existing code keeps working without changes; new code should prefer `LinkClient`.
-- **Per-peer keys auth.** The hub's `secret` option now accepts `string` (shared mode, v0.3.x-compatible), `Record<kind, string>` (static map), or `(kind) => string | Promise<string>` (dynamic resolver). The hub becomes a re-signing relay: each peer signs and verifies with its own key, and the hub re-signs each fan-out per recipient. Wire-compatible - clients see no API change, only operators see the new shape. See [Per-peer keys](#per-peer-keys).
-- **Hub `EventEmitter` surface.** `createHub` now returns an `EventEmitter`. New events for `peer.connect`, `peer.disconnect`, `peer.replaced`, `peer.timeout`, `protocol-error`, `topic.subscribe`/`unsubscribe`/`publish`, `rpc.forwarded`/`response.forwarded`/`server`, `direct`, `backpressure`, `message`. Plus `hub.health()` returning a snapshot of peer/socket/topic counts. See [Hub events](#hub-events).
-- **`link.ready()` and the `'ready'` event.** A new connection-lifecycle gate distinct from `'verified'`. `'verified'` fires when crypto checks pass; `'ready'` fires when the hub *accepts* the hello. `link.ready({ timeoutMs })` returns a promise that resolves on `'ready'` and rejects with `HelloRejectedError` on `'rejected'`. This is now the recommended startup pattern. See [Connection lifecycle](#connection-lifecycle).
-- **Pub/sub topics.** `link.subscribe(topic, handler)`, `link.unsubscribe(topic, handler?)`, `link.publish(topic, payload)`. See [Pub/sub topics](#pubsub-topics) for full semantics. Subscriptions automatically replay across reconnects.
-- **Directed fire-and-forget - `link.send(to, type, data)`.** The third primitive alongside `rpc()` (directed with response) and `publish()` (broadcast no response). The hub forwards with trusted `from`-stamping; receivers subscribe to the `'direct'` event. See [Directed fire-and-forget](#directed-fire-and-forget). *(since v0.4.0)*
-- **Dynamic RPC handler registration.** `link.handle(rpcType, fn)` and `link.unhandle(rpcType)` for adding/removing handlers at runtime, e.g. on every `'ready'` from a plugin. Constructor-time `rpcHandlers` still works. *(since v0.4.0)*
-- **`link.waitFor(event, { timeoutMs?, signal? })`.** Replaces `await new Promise(r => link.once('ready', r))` with a one-liner that has a real timeout. *(since v0.4.0)*
-- **`link.health()`.** Synchronous snapshot of `{ connected, verified, ready, lastVerifiedAt, peerCount, pendingRpcCount, subscriptionCount, bufferedAmount, reconnectAttempt, stopped }` for `/health` integrations. *(since v0.4.0)*
-- **Typed error classes.** `RpcTimeoutError`, `RpcDisconnectError`, `RpcAbortError`, `RpcRemoteError`, `BackpressureError`, `LinkNotReadyError`, `FeatureUnsupportedError`, `ProtocolError`, `HelloRejectedError`, plus the bases `RpcError` and `LinkError`. Each carries a stable `code` string and call-site context (`to`, `rpcType`, `id`, `timeoutMs`, `bufferedAmount`, `op`, `feature`, …). All extend `Error`, so existing catch-all paths still work. *(since v0.4.0)*
-- **`AbortSignal` for RPC.** `link.rpc(to, type, data, { timeoutMs, signal })`. Compose with whatever cancellation the caller already has. The legacy positional `timeoutMs: number` form is still accepted. *(since v0.4.0)*
-- **`'rpc.complete'` lifecycle event.** Unified single hook for outbound-RPC outcomes - fires exactly once per `rpc()` call with `{ id, to, rpcType, ok, reason, durationMs, error }`. Convenient for metrics/tracing. `'rpc.abort'` and `'rpc.disconnect'` were also added for symmetry with the existing `'rpc.timeout'`.
-- **Hub capability advertisement.** The hub now announces `features` in `hello.ack`, captured client-side as `link.hubFeatures` - `['topics', 'direct']` for a v0.4.0+ hub. `publish()` and `send()` throw `FeatureUnsupportedError` against any hub that doesn't advertise the corresponding feature, including v0.3.x hubs that don't advertise anything at all (treated as "no features" so the call fails loud rather than silently dropping at the hub).
-- **Pre-hello socket timeout.** New `helloTimeoutMs` option on the hub (default 10 s). Closes a DoS surface where the keep-alive ping interval iterated only authenticated peers, so a TCP client could open a socket and never speak.
-- **Pluggable hash algorithm.** New `hashAlgo` option on both client and hub (default `'sha256'`). Useful for FIPS-mode deployments. Both ends must agree; the wire envelope is unchanged.
-- **Permessage-deflate.** `perMessageDeflate` pass-through on `LinkClient` and `createHubServer`. Off by default - enable on trusted networks if you want compression.
-- **Backpressure.** New `maxBufferedBytes` option (default 4 MiB) on both client and hub. When `ws.bufferedAmount` exceeds the cap, status updates and fire-and-forget messages (`publish()`, `send()`) drop with a `'backpressure'` event; `rpc()` rejects synchronously with `BackpressureError` (`err.code === 'BACKPRESSURE'`); hub-side RPC forwards return an error response to the original caller.
-- **Bounded `hello` payload.** The hub now sanitizes each peer's hello to a whitelist of `kind` / `name` / `pid` / `startedAt`, dropping unknown fields and capping string lengths.
-- **`makeMsg` deep-clones `data`.** Reverts the v0.3.2 reference-passing behavior. Callers may now freely mutate the input after calling `makeMsg` without affecting the signed envelope. Internally uses `structuredClone`, which is faster than the old JSON round-trip. Note: `data` must remain `structuredClone`-compatible (functions, class instances with methods, and DOM nodes will throw) **and** JSON-round-trippable for the wire to carry it correctly. `Date` becomes its ISO string on the wire (via `toJSON`); `Map`/`Set`/`Uint8Array` lose their identity to plain `{}`/`[]` after JSON. Serialize exotic types yourself if the receiver needs to reconstruct them.
-- **`link.topic.list` and `link.health` server RPCs.** Built-in introspection: `await link.rpc('server', 'link.topic.list', { topic })` returns subscribers; `link.health` returns the hub-side snapshot.
-- **Bug fix: peer-routed RPC.** `rpc.response` is now exempt from the id-replay check on both client and hub. The old behavior caused responses to be dropped because they carry the same `id` as the request that was already added to the recent-id cache; peer-routed RPCs (e.g. `cli → secs`) silently timed out as a result. The timestamp-window check still applies - only the id check changes for response messages.
-- **Bug fix: `hello.ack ok:false` reconnect-backoff.** Reconnect backoff used to reset on the first verified message - *including* a `hello.ack` with `ok: false`. A client with a wrong secret could therefore hammer the hub at the initial reconnect interval indefinitely. The reset is now driven by the new `'ready'` transition (i.e. the hub *accepting* the hello). On rejection, the client by default also `stop()`s itself.
-- **Bug fix: `start()`/`stop()` race.** `start()` now also recognizes `CLOSING`/`CLOSED` socket states and detaches the orphan socket's listeners before opening a new connection; `stop()` does the same up front. Without this, racing `stop()` then `start()` could leave a stale closing socket whose `close` handler fired *after* the new connection was up, scheduling a duplicate reconnect timer or clearing timers belonging to the new socket. *(since v0.4.0)*
-
-**Behavior changes worth flagging on upgrade:**
-
-1. The hub stores only the sanitized hello, not the raw `msg.data`. Code that read non-whitelisted fields off `peer.hello` in `/state` or `getState()` will now see them missing. If you need extra hello fields, raise an issue - they were never part of the documented surface.
-2. `makeMsg(secret, { data })` no longer references `data` directly. Code that called `makeMsg` and then mutated the original to alter the envelope (which always violated the docs) needs to mutate the *returned* `msg.data` instead.
-3. The `'verified'` event payload no longer includes `features` - `features` moved to the new `'ready'` event (which is the connection-acceptance gate). Existing handlers that destructured only `kind` are unaffected. `link.hubFeatures` continues to work.
-4. `subscribe()` / `publish()` / `send()` now require `'ready'` rather than just `'verified'`. With shared-secret hubs (which always accept correctly-signed hellos) there is no observable difference; with per-peer-keys hubs, the new gate prevents publishing into a connection that's about to be rejected. The recommended pattern is `await link.ready()` after `start()`.
-5. `hello.ack ok:false` now triggers a client-side `stop()` by default rather than reconnecting forever. Set `reconnectOnRejection: true` to keep retrying with growing backoff.
-6. `rpc()` rejections are now typed-error instances rather than plain `Error` - including remote-handler errors, which produce `RpcRemoteError`. Existing `Error.message` strings are unchanged, so `e.message.includes('timeout')` keeps working - but `e instanceof RpcTimeoutError` (or `e.code === 'RPC_TIMEOUT'`) is the recommended pattern going forward.
-7. `publish()` and `send()` now throw `LinkNotReadyError` / `FeatureUnsupportedError` (both extend `LinkError`) instead of plain `Error`. The error messages are unchanged, so substring-matching catches keep working; `instanceof` is the recommended new-code pattern.
-
 ## Quick start
 
 There are two ways to run a hub:
 
-- **`createHubServer`** - batteries-included. Spins up the HTTP server, WebSocket server, default `/health` + `/state` routes, signal handling, and graceful shutdown for you. Use this when the hub is the whole job.
+- **`createHubServer`** - batteries-included. Spins up the HTTP server, WebSocket server, a default `/health` route, an opt-in `/state` route, signal handling, and graceful shutdown for you. Use this when the hub is the whole job.
 - **`createHub`** - transport-agnostic. You bring the HTTP/WebSocket server. Use this when you're embedding the hub inside a larger app (Express, Fastify, an existing service).
 
 ### Run a hub (batteries-included)
@@ -91,7 +93,7 @@ server.start();
 
 That's the whole thing. You get:
 
-- An HTTP server on `:8080` with `GET /health` and `GET /state` already wired.
+- An HTTP server on `:8080` with `GET /health` already wired. (`GET /state` is opt-in: pass `enableStateRoute: true`.)
 - A WebSocket server attached to it, routing connections into the hub.
 - `SIGINT`/`SIGTERM` handlers that run a graceful shutdown (close WSS → close client sockets → terminate stragglers → close HTTP → stop hub).
 
@@ -320,7 +322,7 @@ link.unsubscribe('events.user.signup');
 
 **Behavior notes:**
 
-- **Topic names** must match `[a-zA-Z0-9._-]+`, length 1–256. Wildcards (`*`, `**`) are reserved for v0.5+ and currently rejected. Invalid topics throw synchronously on `subscribe`/`publish`/`unsubscribe`.
+- **Topic names** must match `[a-zA-Z0-9._-]+`, length 1–256. Wildcards (`*`, `**`) are reserved for a future release and currently rejected. Invalid topics throw synchronously on `subscribe`/`publish`/`unsubscribe`.
 - **No self-delivery in v0.4.** A peer that publishes to a topic does not receive its own message even if subscribed. (`worker-1` publishing `events.x` will not fire `worker-1`'s own `events.x` handler.)
 - **At-most-once.** If a subscriber is offline at publish time, they miss the message - pub/sub does not queue or persist. If you need durability, use RPC against a hub-handled handler that writes to your own store.
 - **Trusted `from`.** The hub overwrites `msg.from` with the publisher's authenticated kind before forwarding, same as RPC. Subscribers can rely on `msg.from` for routing/authorization.
@@ -562,7 +564,7 @@ The legacy positional form `link.rpc(to, type, data, timeoutMs)` is still accept
 
 - Run the hub on `localhost` or a private network. If you must cross a network boundary, terminate `wss://` at a reverse proxy (nginx, Caddy, Cloudflare) - don't expose `ws://` over the public internet.
 - Treat secrets like database passwords. Don't commit them. With per-peer keys, you can rotate one peer's key without restarting everyone.
-- The default `/state` route on `createHubServer` exposes peer kinds, hello payloads, and last-known status. Keep it on a non-public port, gate it behind your own auth, or set `enableStateRoute: false`.
+- The `/state` route on `createHubServer` exposes peer kinds, hello payloads, and last-known status. **In v0.5 the default is `enableStateRoute: false`**; opt in explicitly for internal dashboards / dev (`createHubServer({ enableStateRoute: true })`). If you opt in *and* bind to `0.0.0.0`, the hub also emits an informational warning at startup.
 - When embedding the hub inside an existing HTTP server (`server: yourServer`), **always pass a `path`** unless you're certain no other code on that server uses WebSocket upgrades. Without it, the hub intercepts every upgrade.
 
 ## Per-peer keys
@@ -572,7 +574,7 @@ By default, `createHub({ secret: 'sometext' })` runs in **shared-secret mode** -
 Per-peer keys (since v0.4.0) lets you give each peer its own HMAC key. Pass an object or a function as `secret`:
 
 ```js
-// Static map. Hellos for unknown kinds are silently dropped.
+// Static map. Hellos for unknown kinds are silently dropped
 const hub = createHub({
   secret: {
     coordinator: process.env.LINK_KEY_COORD,
@@ -583,7 +585,7 @@ const hub = createHub({
 ```
 
 ```js
-// Dynamic resolver. Async permitted; returning null means "no key for that kind".
+// Dynamic resolver. Async permitted; returning null means "no key for that kind"
 const hub = createHub({
   secret: async (kind) => {
     const v = await vault.get(`link/${kind}`);
@@ -620,6 +622,244 @@ const link = new LinkClient({
 **Hello rejection behavior.** When a hello cannot be verified - wrong key, unknown kind, or malformed - the hub drops the message silently and lets the [pre-hello timeout](#api) (default 10 s) reap the socket. The hub does not return `hello.ack ok:false` for these cases, on purpose: it would confirm to an attacker that a particular kind exists. The client sees the diagnostic `protocol-error` reason `'no-ack'` after `helloAckDiagnosticMs` and reconnects with growing backoff.
 
 If your application *does* want explicit rejection feedback (e.g. for an internal admin tool), surface it via your own RPC after `'ready'` rather than embedding it in the auth handshake.
+
+## Helpers
+
+Since v0.5.0, `link-core` ships a collection of helper functions covering the patterns that kept showing up in my own use in services - a leveled logger, env coercion, observability listener bundles, RPC retries and safe-publish wrappers, graceful shutdown, a secrets loader for secrets vault client, and a dashboard-friendly event recorder.
+
+Everything is also reachable via the `./helpers` subpath if you'd rather keep the helper namespace separate from the protocol/client/hub surface at the package root:
+
+```js
+// flat from the root
+const { createLogger, attachClientObservability, loadSecrets } = require('@presenc3/link-core');
+
+// namespaced via the subpath
+const helpers = require('@presenc3/link-core/helpers');
+helpers.createLogger();
+```
+
+Both forms point at the same functions. Pick whichever fits the call site.
+
+### Logger - `createLogger`
+
+A four-level logger (DEBUG/INFO/WARN/ERROR) with a structured `[HH:MM:SS.mmm] [context] message` prefix and an optional `errorSink` for mirroring errors to a webhook, Sentry, etc.
+
+```js
+const { createLogger, LEVELS } = require('@presenc3/link-core');
+
+const log = createLogger({
+  minLevel: LEVELS.INFO,                 // or 'INFO' / 'DEBUG' / etc
+  errorSink: async (ctx, msg, err) => {  // optional; receives Error instances passed to lE()
+    await postToDiscord({ ctx, msg, err });
+  },
+});
+
+log.l ('boot', 'starting up');            // info
+log.lD('boot', 'verbose detail');         // debug (suppressed at minLevel=INFO)
+log.lW('link', 'unexpected, but recoverable');
+log.lE('link', 'init failed', err);       // also fires errorSink
+```
+
+All four methods take `(context, message, ...args)`. The `errorSink` is fire-and-forget - sink failures are logged via `console.error` and never propagate.
+
+The default `minLevel` is `INFO` when `NODE_ENV === 'production'` and `DEBUG` otherwise. Override via `setMinLevel(...)` at runtime if you need to switch on the fly.
+
+### Env - `num`, `bool`, `requireEnv`, `linkClientOptionsFromEnv`
+
+Coercion helpers that return `undefined` for missing/empty inputs (so callers can `?? defaultValue` without sentinel collisions on `0` / `false`), plus a one-shot assembler for the standard LinkClient option bag.
+
+```js
+const { LinkClient } = require('@presenc3/link-core');
+const { requireEnv, linkClientOptionsFromEnv } = require('@presenc3/link-core');
+
+requireEnv(['LINK_URL', 'LINK_KIND', 'LINK_SECRET']);   // throws listing every missing key
+
+const link = new LinkClient({
+  /* reads
+   * LINK_URL,    LINK_KIND,
+   * LINK_SECRET, LINK_HASH_ALGO,
+   * LINK_PERMESSAGE_DEFLATE, LINK_RECONNECT_ON_REJECTION,
+   * LINK_RECONNECT_JITTER,   LINK_REPLAY_WINDOW_MS,
+   * LINK_MAX_RECENT_IDS,     LINK_MAX_MESSAGE_BYTES,
+   * LINK_MAX_BUFFERED_BYTES
+  **/
+  ...linkClientOptionsFromEnv(),
+  name: 'My Service',
+  makeStatus,
+  rpcHandlers,
+  // A LeveledLogger from createLogger() satisfies the two-method
+  // Logger shape directly - no adapter required. Pre-v0.5 code used
+  // `{ log: log.l, warn: log.lW }`; that still works for back-compat.
+  logger: log,
+});
+```
+
+Pass `linkClientOptionsFromEnv(env, { envPrefix: 'FOO_' })` to read `FOO_URL` / `FOO_KIND` / etc. instead.
+
+### Observability - `attachClientObservability`, `attachHubObservability`
+
+Wire the standard listener bundles onto a `LinkClient` or hub `EventEmitter`. Membership churn at info, security-relevant drops at warn, per-RPC trace at debug (or info when `verbose: true`); `protocol-error` reasons are classified into "concerning" (worth surfacing) vs "noisy" (clock drift, dedupe) and routed accordingly.
+
+```js
+const { attachClientObservability, attachHubObservability } = require('@presenc3/link-core');
+
+attachClientObservability(link, { logger: log, context: 'link' });
+attachHubObservability(server.hub, { logger: log, context: 'hub' });
+```
+
+To extend the default reason classification without losing the built-ins, pass `extraConcerningReasons: ['my-custom-reason']`. To replace it outright, pass `concerningReasons: [...]`. The defaults are also exported (`DEFAULT_CLIENT_CONCERNING_REASONS`, `DEFAULT_HUB_CONCERNING_REASONS`) if you want to inspect or build atop them.
+
+### RPC + topic helpers - `waitForPeer`, `rpcWithRetry`, `createSafePublisher`, `createSafeSend`
+
+`waitForPeer(link, kind, { timeoutMs, requireConnected })` blocks until a peer of the given kind appears (and, by default, is connected). Event-driven - uses `link.waitFor('peer.connect', ...)` internally, no polling.
+
+```js
+await waitForPeer(link, 'vault', { timeoutMs: 30_000 });
+```
+
+`rpcWithRetry(link, to, type, data, { tries, timeoutMs, baseDelayMs, signal })` retries on transient failures (`RpcTimeoutError`, `RpcDisconnectError`) but never on `RpcAbortError` (caller cancelled) or `RpcRemoteError` (handler said no). Linear backoff with jitter.
+
+```js
+const result = await rpcWithRetry(link, 'worker', 'job.run', payload, { tries: 3 });
+```
+
+`createSafePublisher(link, { logger })` and `createSafeSend(link, { logger })` wrap `link.publish` / `link.send` so they never throw on the common transient conditions (mid-reconnect, hub doesn't advertise topics/direct). The first feature-unsupported skip logs at warn, subsequent skips at debug - useful when running against a v0.3-era hub that doesn't advertise capabilities and you'd otherwise drown in identical warnings.
+
+```js
+const publish = createSafePublisher(link, { logger: log, context: 'handlers' });
+publish('user.changed', { id: 42 });   // returns boolean - false on any drop
+
+const send = createSafeSend(link, { logger: log, context: 'fanout' });
+send('worker', 'job.queued', { id: 42 });
+```
+
+Pass `featureCheck: true` to short-circuit the publish/send entirely when `link.hubFeatures` doesn't include the feature - avoids one wasted throw-per-call on v0.3 hubs.
+
+### Lifecycle - `installProcessHandlers`, `createGracefulShutdown`
+
+Kept separate so the shutdown procedure can be unit-tested without touching `process.on(...)`.
+
+```js
+const { installProcessHandlers, createGracefulShutdown } = require('@presenc3/link-core');
+
+const shutdown = createGracefulShutdown({
+  logger: log,
+  timeoutMs: 30_000,
+  steps: [
+    () => link.stop(),
+    async () => { await closeDBs(); },
+  ],
+});
+
+installProcessHandlers({ shutdown, logger: log });
+```
+
+`installProcessHandlers` wires up `SIGINT`, `SIGTERM`, `uncaughtException`, and `unhandledRejection`. Returns an `uninstall()` function that removes everything it added (useful in tests).
+
+`createGracefulShutdown` runs its steps sequentially and is bounded by a watchdog timer that force-exits if anything hangs. A throwing step is logged via `lE` but does not stop subsequent steps from running. Calling the returned `shutdown()` while one is already in progress is a no-op.
+
+### Secrets - `loadSecrets`
+
+Fetch a `{ envName: 'sec/<ns>/<rest>' }` mapping from the `link_secs` vault peer at boot, optionally subscribing to `secs.changed.<ns>` for hot-reload on rotation.
+
+```js
+const { loadSecrets, LOADED_SECRETS_UNWATCH } = require('@presenc3/link-core');
+
+const cfg = await loadSecrets(link, {
+  OPENAI_API_KEY: 'sec/shared/openai',
+  SENTRY_DSN:     'sec/datastore/sentry-dsn',
+}, {
+  watch: true,                        // requires a v0.4+ hub
+  logger,                             // optional LeveledLogger; uses console.warn otherwise
+  onChange: ({ name, action, newValue }) => {
+    // rebuild your frozen cfg snapshot, re-init clients, etc.
+  },
+});
+
+// later, on shutdown / test teardown:
+cfg[LOADED_SECRETS_UNWATCH]?.();
+```
+
+`loadSecrets` waits for `link.ready()` *and* for a vault peer to be present before fetching, both bounded by a single cumulative `timeoutMs` budget (default 30 s; every individual `secs.get` RPC shares the same deadline). It throws if any secret is missing on the initial load or returned with the wrong type - fail-fast at boot is much better than silently running with `undefined` keys.
+
+The returned object is **mutated in-place** when watched secrets change, so a frozen snapshot held by the caller will go stale. Use `onChange` to rebuild your own snapshot.
+
+When `watch: true`, the returned object also carries a non-enumerable `[LOADED_SECRETS_UNWATCH]` method (Symbol-keyed so it can't collide with a secret env name) that removes the rotation subscriptions. Idempotent and only removes the helper's own subscriptions; caller-installed handlers on the same topic are untouched.
+
+**Rotation event schema.** When `watch: true`, the helper subscribes to `secs.changed.<ns>` for every namespace referenced in the mapping. The vault is expected to publish payloads of shape:
+
+```ts
+{
+  path: string,                // e.g. 'sec/shared/openai'
+  action: 'set' | 'del'        // 'set' triggers a refetch via secs.get; 'del' clears the key locally
+}
+```
+
+Paths the helper doesn't care about are silently ignored, so it's safe for the vault to broadcast a single `secs.changed.<ns>` event covering all paths in that namespace.
+
+### Event recorder - `createEventRecorder`
+
+A dashboard-friendly observer that wraps a `LinkClient` with a bounded ring buffer of recorded events plus a snapshot of current bus state. Designed for SSE consumers (or any "what's happening right now" panel) that want a single subscribe call and don't want to assemble peer / status / health / event-log themselves on every frame.
+
+```js
+const { createEventRecorder } = require('@presenc3/link-core');
+
+const recorder = createEventRecorder(link, {
+  ringSize:            30,    // default; max events kept
+  heartbeatIntervalMs: 1000,  // default; periodic snapshot emit. 0 disables
+  startedAt:           Date.now(),
+});
+
+// SSE consumer: gets the current snapshot immediately, then every
+// time something interesting happens on the bus (peer joins/leaves,
+// hub ready/disconnect, peer status), plus a heartbeat tick
+const unsub = recorder.onSnapshot((snap) => {
+  res.write(`data: ${JSON.stringify(snap)}\n\n`);
+});
+
+// ... later
+unsub();
+recorder.close();   // detach all listeners, clear heartbeat
+```
+
+The snapshot shape is:
+
+```js
+{
+  connected, ready,
+  self: { kind, name, features },
+  peers,         // link.getPeers()
+  statuses,      // { [peerKind]: link.getPeerStatus(kind) } for every peer with a status
+  startedAt,     // the option you passed in
+  health,        // link.health() snapshot, or null
+  eventLog,      // copy of the ring buffer
+  at,            // Date.now() at snapshot build time
+  _reason,       // 'tick' | 'ready' | 'peer.connect' | ... - present on auto-emits
+}
+```
+
+Recorded event shape is `{ kind, from, ...detail, t }`. The `kind` taxonomy normalizes hub-side events into a dashboard-friendly vocabulary:
+
+| `kind`            | trigger                                  | snapshot? |
+|-------------------|------------------------------------------|-----------|
+| `hub-up`          | `link` event `'ready'`                   | yes       |
+| `rejected`        | `link` event `'rejected'`                | yes       |
+| `hub-down`        | `link` event `'disconnect'`              | yes       |
+| `join`            | `link` event `'peer.connect'`            | yes       |
+| `leave`           | `link` event `'peer.disconnect'`         | yes       |
+| `status`          | `link` event `'peer.status'` (non-self)  | yes       |
+| `protocol-error`  | `link` event `'protocol-error'`          | no        |
+| `backpressure`    | `link` event `'backpressure'`            | no        |
+| `rpc-fail`        | `link` event `'rpc.complete'` with `ok:false` | no   |
+| `direct`          | `link` event `'direct'`                  | no        |
+
+Membership-and-lifecycle events also fire a snapshot emit, so a subscriber doesn't wait up to one heartbeat for the first frame after a peer joins. The heartbeat is the floor - it guarantees a frame even on a fully idle network so the dashboard's "last beat" age label keeps moving. Set `heartbeatIntervalMs: 0` to disable if your transport doesn't need it.
+
+The recorder is observation-only: it doesn't call `publish` / `send` / `rpc` and doesn't depend on hub features. It works against any v0.4+ `LinkClient`. Combine with `attachClientObservability` if you also want log lines for these events - they're independent.
+
+For per-event subscribers (e.g. a live log panel that wants every event individually, not a full snapshot), use `recorder.onEvent(fn)`. That one does **not** replay history on subscribe; call `recorder.getRecent()` first if you need the ring buffer too.
+
+`close()` is idempotent and detaches every listener the recorder added to the underlying `LinkClient`. Always call it before discarding the recorder, or you'll leak listeners across reconnects.
 
 ## API
 
@@ -690,6 +930,7 @@ Properties:
 | `'message'`        | `{ msg, raw }`                                                       | Power-user firehose: every verified message post-checks.                  |
 | `'peer.connect'`   | `peer` (PeerInfo)                                                    | A new peer kind appeared in the latest `peers.update`.                    |
 | `'peer.disconnect'`| `peer` (PeerInfo)                                                    | A peer kind disappeared from the latest `peers.update`.                   |
+| `'peer.replaced'`  | `{ kind, prevPeer, peer }`                                           | A peer of the same `kind` reconnected with a fresh socket (different `connectedAt`). Both `prevPeer` and `peer` are `PeerInfo` objects, so `peer.connectedAt` and `prevPeer.connectedAt` give you the old and new stamps. Fires *after* internal `peers` state has been updated, so `link.getPeers()` from inside the handler reflects the new connection. Useful for tearing down per-connection state without inferring it from the `disconnect`/`connect` pair (which doesn't fire on same-kind replacement). (since v0.5) |
 | `'peer.status'`    | `{ from, status, at }`                                               | A peer broadcast a status update.                                         |
 | `'rpc.request'`    | `{ from, rpcType, rpcData, msg }`                                    | An incoming RPC request was received (fires before the handler runs).     |
 | `'rpc.timeout'`    | `{ id, to, rpcType, timeoutMs }`                                     | A pending outbound RPC timed out.                                         |
@@ -725,6 +966,7 @@ Returns an `EventEmitter` with `attach`, `getState`, `health`, and `stop` method
 | `logger`              | `object\|null` | no       | console       | Custom logger with `log` and `warn` methods, or `null` to silence.                            |
 | `keepaliveIntervalMs` | `number`       | no       | `15000`       | Ping cadence for liveness detection (post-hello sockets only).                                |
 | `helloTimeoutMs`      | `number`       | no       | `10000`       | Time after socket open to wait for a successful `hello`. Closes the socket if missed. Set to `0` to disable. |
+| `maxPendingSockets`   | `number`       | no       | `1024`        | Cap on concurrent un-authenticated sockets. When exceeded, the oldest pending socket is force-closed (FIFO eviction) and emits `peer.timeout` with `reason: 'pending-cap'`. Defends against attackers opening many TCP connections and never speaking. (since v0.5) |
 | `replayWindowMs`      | `number`       | no       | `300000`      | Replay-protection window (matching the client). Set to `0` to disable.                        |
 | `maxRecentIds`        | `number`       | no       | `10000`       | Cap on remembered message ids.                                                                |
 | `maxMessageBytes`     | `number`       | no       | `1048576`     | Defensive in-handler size check. `createHub` is transport-agnostic; set `maxPayload` on your `WebSocketServer` separately. (`createHubServer` does this for you.) |
@@ -747,7 +989,7 @@ The returned `EventEmitter` emits the following events. All are observability-on
 | `peer.connect`            | `{ kind, hello, connectedAt, replaced }`                                 | A peer completed the hello handshake.                      |
 | `peer.disconnect`         | `{ kind, hello, connectedAt, code?, reason }`                            | A peer's socket closed (or hub force-closed it).           |
 | `peer.replaced`           | `{ kind, prevHello, newHello }`                                          | A new socket completed hello with the same `kind`.         |
-| `peer.timeout`            | `{ remoteAddress, helloTimeoutMs }`                                      | Pre-hello socket reaped.                                   |
+| `peer.timeout`            | `{ remoteAddress, helloTimeoutMs, reason? }`                             | Pre-hello socket reaped (no hello within `helloTimeoutMs`) or evicted due to `maxPendingSockets` cap. `reason: 'pending-cap'` when capped; absent for natural timeouts. |
 | `protocol-error`          | `{ reason, kind, type?, detail? }`                                       | A message was dropped at the hub.                          |
 | `topic.subscribe`         | `{ kind, topic }`                                                        | First subscriber for that kind on that topic.              |
 | `topic.unsubscribe`       | `{ kind, topic }`                                                        | Last unsubscribe by that kind on that topic.               |
@@ -788,15 +1030,16 @@ A batteries-included wrapper around `createHub`. Creates and manages the HTTP se
 | `path`              | `string`              | -             | If set, only handle WebSocket upgrades at this path (e.g. `'/link'`). Otherwise all upgrades are handled. |
 | `routes`            | `object`              | `{}`          | Map of `pathname → (req, res) => void \| Promise<void>`. User routes win over the defaults below. |
 | `enableHealthRoute` | `boolean`             | `true`        | Adds `GET /health` returning `{ ok, now, hub: hub.health() }`. Ignored when `server` is provided. |
-| `enableStateRoute`  | `boolean`             | `true`        | Adds `GET /state` returning `{ ...hub.getState(), ...extraState() }` pretty-printed. Ignored when `server` is provided. **Note:** binding `0.0.0.0` with `/state` enabled exposes peer kinds, hello payloads, and last-known statuses. The hub logs a warning at startup unless you explicitly set both `host` and `enableStateRoute`; recommended productions are `enableStateRoute: false` or `host: '127.0.0.1'` (with /state behind a reverse proxy or ssh tunnel). |
+| `enableStateRoute`  | `boolean`             | `false` (since v0.5) | Adds `GET /state` returning `{ ...hub.getState(), ...extraState() }` pretty-printed. Ignored when `server` is provided. The route exposes peer kinds, hello payloads, `connectedAt`, and last-known statuses; opt in explicitly for internal dashboards / dev. Binding `0.0.0.0` with `/state` enabled still emits an informational startup warning. (Default was `true` in v0.4 - see the v0.5 changelog.) |
 | `extraState`        | `function`            | -             | `() => object \| Promise<object>`. Merged into `/state` after `hub.getState()`. Use this for app-specific state like `{ kvKeys: 42 }`. |
-| `handleSignals`     | `boolean`             | `true`        | Install `SIGINT`/`SIGTERM` handlers that call `stop()`. Set to `false` if you already manage signals. |
+| `handleSignals`     | `boolean`             | `true`        | Install `SIGINT`/`SIGTERM` handlers that call `stop()`. Set to `false` if you already manage signals **or** if you create multiple `createHubServer` instances in one process (each instance would otherwise install its own handler and they'd all fire on a signal). |
 | `signals`           | `string[]`            | `['SIGINT','SIGTERM']` | Which signals to handle when `handleSignals` is `true`.                                  |
 | `shutdownTimeoutMs` | `number`              | `30000`       | Hard cap on how long graceful shutdown is allowed to take before it errors out.                   |
 | `drainDelayMs`      | `number`              | `250`         | Time to wait between asking clients to close and force-terminating stragglers.                    |
 | `onShutdown`        | `function`            | -             | `async () => void`. Runs at the **end** of shutdown, after sockets and the HTTP server are closed. Perfect for flushing files or closing DB connections. |
 | `keepaliveIntervalMs` | `number`            | `15000`       | Forwarded to `createHub`. Ping cadence for liveness detection.                                    |
 | `helloTimeoutMs`    | `number`              | `10000`       | Forwarded to `createHub`. Pre-hello socket timeout. Set to `0` to disable.                        |
+| `maxPendingSockets` | `number`              | `1024`        | Forwarded to `createHub`. Cap on concurrent un-authenticated sockets (FIFO eviction). (since v0.5) |
 | `replayWindowMs`    | `number`              | `300000`      | Forwarded to `createHub`. Replay-protection window. Set to `0` to disable.                       |
 | `maxRecentIds`      | `number`              | `10000`       | Forwarded to `createHub`. Cap on remembered message ids.                                          |
 | `maxMessageBytes`   | `number`              | `1048576`     | Maximum incoming WebSocket frame size (1 MiB). Set as `maxPayload` on the `WebSocketServer` and as a defensive in-handler check. |
@@ -837,13 +1080,16 @@ const server = createHubServer({
   // hub-handled RPCs (to: 'server')
   rpcHandlers: kv.handlers,
 
+  // opt /state in (v0.5+ default is false) so we can publish a dashboard
+  enableStateRoute: true,
+
   // expose the kv size on /state alongside { peers, lastStatus }
   extraState: () => ({ kvKeys: kv.size }),
 
   // flush pending writes before the process exits
   onShutdown: () => kv.flushSync(),
 
-  // a custom HTTP route alongside /health and /state
+  // a custom HTTP route alongside /health (and /state, since we opted in above)
   routes: {
     '/version': (req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -978,9 +1224,97 @@ npm install --save-dev @types/ws
 
 `LinkClient`'s event payloads are fully typed via overloaded `on`/`once`/`off`/`emit` signatures, so `link.on('peer.connect', (peer) => ...)` will infer `peer: PeerInfo`.
 
+Two logger types are exported: `Logger` (the two-method `{ log, warn }` shim that `LinkClient`/`createHub`/`createHubServer` accept as their `logger` option) and `LeveledLogger` (the richer `{ l, lD, lW, lE, ... }` object returned by [`createLogger()`](#logger---createlogger) in the helpers). Since v0.5.0, `LeveledLogger extends Logger` - a `createLogger()` result satisfies `Logger` directly, so you can pass it without an adapter: `new LinkClient({ ..., logger: createLogger() })`. The historical `{ log: leveled.l, warn: leveled.lW }` adapter form still works for back-compat (note `warn: lW`, not `lE` - `LinkClient` uses `logger.warn` for routine drops like backpressure and replayed messages, which should not flood an error sink).
+
+## What's new in v0.5
+
+This release is wire-compatible with v0.4.x (`PROTOCOL_VERSION` is still `1`).
+
+### Highlights
+
+- **Helpers**. A logger, env coercion utilities, observability listener bundles, RPC patterns, lifecycle helpers, a secrets loader, and a dashboard-friendly event recorder - twenty-one symbols in total, all exported flat from the package root and also reachable via a new `./helpers` subpath. See [Helpers](#helpers).
+- **`LinkBusClient` alias removed.** The deprecated alias announced in v0.4.0 ("kept as an alias in v0.4.x for backwards compatibility and will be removed in v0.5.0") is gone, along with its `LinkBusClientOptions` / `LinkBusClientEvents` type aliases. Rename to `LinkClient` / `LinkClientOptions` / `LinkClientEvents` - the underlying class and types are unchanged.
+- **`LeveledLogger` TypeScript type added.** Describes the rich object returned by `createLogger()`. Distinct from the existing two-method `Logger` type that `LinkClient` accepts as its `logger` option.
+- **Line endings normalized.** The source tree is now all LF, matching what `.gitattributes` had declared as intent in v0.4.1. (Previous tarballs shipped CRLF for some files due to a packaging quirk.)
+
+### Safer defaults & fail-fast (potentially breaking)
+
+- **`createHubServer({ enableStateRoute })` defaults to `false`.** Previously `true`. The `/state` route exposes peer kinds, hello payloads, `connectedAt`, and last-known statuses, which is fine for an internal dashboard but undesirable on a public bind. Opt in explicitly for dashboards / dev: `createHubServer({ enableStateRoute: true })`. If you do opt in *and* bind to `0.0.0.0`, an informational warning still fires.
+- **`createHubServer` is single-shot.** Calling `start()` after `stop()` now throws `Error('createHubServer is single-shot…')`. Previously the second `start()` appeared to succeed and produced an undefined-state server. If you need restart, call `createHubServer()` again. A new `isStopped` getter reports whether the server has been torn down.
+- **`createHubServer.stop()` before `start()` now closes `wss`.** Previously left the eagerly-constructed `WebSocketServer` dangling.
+- **`link.rpc()` validates `to` / `rpcType` synchronously.** Invalid arguments now throw `TypeError` at the call site, matching `send()` / `subscribe()` / `publish()`. Previously an invalid `to` produced a delayed `RpcTimeoutError`, indistinguishable from a "peer not reachable" condition.
+- **Numeric options validated up-front.** `LinkClient`, `createHub`, and `createHubServer` reject `NaN`, `Infinity`, negatives, and wrong types with a `TypeError` naming the offending option. Previously `Number(process.env.X) // → NaN` silently turned timers into 0-ms tight loops.
+
+### New capabilities
+
+- **`peer.replaced` client-side event.** Fires when a same-kind peer reconnects (a new `connectedAt` for the same `kind`). Useful for tearing down per-connection state. Was previously a hub-only event; client listeners had to infer replacement from the `peer.connect`/`peer.disconnect` sequence.
+- **Pre-hello DoS cap: `maxPendingSockets`** (default `1024`). The hub now caps concurrent un-authenticated sockets. When over the cap, the oldest pending socket is force-closed (FIFO eviction) and emits `peer.timeout` with `reason: 'pending-cap'` so operators can distinguish capacity pressure from stragglers.
+- **`loadSecrets({ watch })` cleanup handle.** When `watch: true`, the returned object carries a non-enumerable `[LOADED_SECRETS_UNWATCH]` method that tears down the rotation-event subscriptions. Idempotent, safe to call multiple times, and only removes the helper's own subscriptions (caller-installed handlers on the same topic are untouched). Import the symbol from the package root or `./helpers`.
+- **`rpcWithRetry` honors `signal` during backoff.** An abort that fires between retry attempts now surfaces as `RpcAbortError` immediately instead of waiting out the full backoff delay.
+- **`loadSecrets({ logger })` accepts an injectable warn-logger** (`LeveledLogger.lW`-shaped). Used for transient watch-reload failures. Defaults to a `console.warn` wrapper when not provided.
+- **`loadSecrets`'s budget is now actually honored.** Previously the cumulative `timeoutMs` covered `ready()` + `waitForPeer()` but each `secs.get` RPC silently fell back to the client's `defaultRpcTimeoutMs` (5s). Now all RPCs share a single deadline.
+
+### Smaller fixes
+
+- **`getPeers()` / `getPeerStatus()` return defensive copies.** Callers cannot poison internal state by mutating the returned arrays/objects.
+- **`rpc.abort` / `rpc.disconnect` event symmetry.** `rpc.abort` now fires for pre-aborted signals (was missing on the pre-send path). `rpc.disconnect` now fires when `link.stop()` orphans a pending RPC (was missing in the explicit-stop path).
+- **`unhandle()` uses `Object.hasOwn`.** No more false positives for inherited prototype keys (`'constructor'`, `'toString'`, …).
+- **`topic.publish` hub event always carries `delivered`.** Previously omitted on no-subscriber topics, tripping subscriber arithmetic on `undefined`.
+- **Hub `send()` returns boolean.** Previously returned the generated UUID on success (technically truthy, but unclear contract).
+- **`EventRecorder.close()` contract clarified.** After `close()`, `onSnapshot`/`onEvent` return a no-op unsubscribe (previously delivered one initial frame then went silent forever). `getSnapshot()`/`getRecent()` continue working and reflect current state. Docs match code.
+- **TypeScript surface tightened.** `stableStringify` is typed `string | undefined` (it follows `JSON.stringify` semantics for top-level non-serializable values). `LinkClientOptions.url` / `secret` / `kind` are now optional in the type, matching the runtime "disabled if missing" behavior - a `start()` with any of them missing logs a warning and becomes a no-op, and `ready()` rejects synchronously with `LinkNotReadyError` (instead of hanging on the default `timeoutMs: 0`). Useful for service templates that share a code path between a real run and a "no link bus" local-dev mode.
+- **Single-logger ergonomics.** `LeveledLogger` (returned by `createLogger()`) now extends `Logger`, so `new LinkClient({ ..., logger: createLogger() })` works without an `{ log: l, warn: lW }` adapter. The adapter form still works for back-compat.
+
+## What's new in v0.4
+
+This release is wire-compatible with v0.3.x (`PROTOCOL_VERSION` is still `1`) but adds a number of features and one minor surface rename. Most upgrades are drop-in. Highlights:
+
+- **`LinkBusClient` is now `LinkClient`.** The old name remains as a deprecated alias for the v0.4.x line and will be removed in v0.5.0. Existing code keeps working without changes; new code should prefer `LinkClient`.
+- **Per-peer keys auth.** The hub's `secret` option now accepts `string` (shared mode, v0.3.x-compatible), `Record<kind, string>` (static map), or `(kind) => string | Promise<string>` (dynamic resolver). The hub becomes a re-signing relay: each peer signs and verifies with its own key, and the hub re-signs each fan-out per recipient. Wire-compatible - clients see no API change, only operators see the new shape. See [Per-peer keys](#per-peer-keys).
+- **Hub `EventEmitter` surface.** `createHub` now returns an `EventEmitter`. New events for `peer.connect`, `peer.disconnect`, `peer.replaced`, `peer.timeout`, `protocol-error`, `topic.subscribe`/`unsubscribe`/`publish`, `rpc.forwarded`/`response.forwarded`/`server`, `direct`, `backpressure`, `message`. Plus `hub.health()` returning a snapshot of peer/socket/topic counts. See [Hub events](#hub-events).
+- **`link.ready()` and the `'ready'` event.** A new connection-lifecycle gate distinct from `'verified'`. `'verified'` fires when crypto checks pass; `'ready'` fires when the hub *accepts* the hello. `link.ready({ timeoutMs })` returns a promise that resolves on `'ready'` and rejects with `HelloRejectedError` on `'rejected'`. This is now the recommended startup pattern. See [Connection lifecycle](#connection-lifecycle).
+- **Pub/sub topics.** `link.subscribe(topic, handler)`, `link.unsubscribe(topic, handler?)`, `link.publish(topic, payload)`. See [Pub/sub topics](#pubsub-topics) for full semantics. Subscriptions automatically replay across reconnects.
+- **Directed fire-and-forget - `link.send(to, type, data)`.** The third primitive alongside `rpc()` (directed with response) and `publish()` (broadcast no response). The hub forwards with trusted `from`-stamping; receivers subscribe to the `'direct'` event. See [Directed fire-and-forget](#directed-fire-and-forget). *(since v0.4.0)*
+- **Dynamic RPC handler registration.** `link.handle(rpcType, fn)` and `link.unhandle(rpcType)` for adding/removing handlers at runtime, e.g. on every `'ready'` from a plugin. Constructor-time `rpcHandlers` still works. *(since v0.4.0)*
+- **`link.waitFor(event, { timeoutMs?, signal? })`.** Replaces `await new Promise(r => link.once('ready', r))` with a one-liner that has a real timeout. *(since v0.4.0)*
+- **`link.health()`.** Synchronous snapshot of `{ connected, verified, ready, lastVerifiedAt, peerCount, pendingRpcCount, subscriptionCount, bufferedAmount, reconnectAttempt, stopped }` for `/health` integrations. *(since v0.4.0)*
+- **Typed error classes.** `RpcTimeoutError`, `RpcDisconnectError`, `RpcAbortError`, `RpcRemoteError`, `BackpressureError`, `LinkNotReadyError`, `FeatureUnsupportedError`, `ProtocolError`, `HelloRejectedError`, plus the bases `RpcError` and `LinkError`. Each carries a stable `code` string and call-site context (`to`, `rpcType`, `id`, `timeoutMs`, `bufferedAmount`, `op`, `feature`, …). All extend `Error`, so existing catch-all paths still work. *(since v0.4.0)*
+- **`AbortSignal` for RPC.** `link.rpc(to, type, data, { timeoutMs, signal })`. Compose with whatever cancellation the caller already has. The legacy positional `timeoutMs: number` form is still accepted. *(since v0.4.0)*
+- **`'rpc.complete'` lifecycle event.** Unified single hook for outbound-RPC outcomes - fires exactly once per `rpc()` call with `{ id, to, rpcType, ok, reason, durationMs, error }`. Convenient for metrics/tracing. `'rpc.abort'` and `'rpc.disconnect'` were also added for symmetry with the existing `'rpc.timeout'`.
+- **Hub capability advertisement.** The hub now announces `features` in `hello.ack`, captured client-side as `link.hubFeatures` - `['topics', 'direct']` for a v0.4.0+ hub. `publish()` and `send()` throw `FeatureUnsupportedError` against any hub that doesn't advertise the corresponding feature, including v0.3.x hubs that don't advertise anything at all (treated as "no features" so the call fails loud rather than silently dropping at the hub).
+- **Pre-hello socket timeout.** New `helloTimeoutMs` option on the hub (default 10 s). Closes a DoS surface where the keep-alive ping interval iterated only authenticated peers, so a TCP client could open a socket and never speak.
+- **Pluggable hash algorithm.** New `hashAlgo` option on both client and hub (default `'sha256'`). Useful for FIPS-mode deployments. Both ends must agree; the wire envelope is unchanged.
+- **Permessage-deflate.** `perMessageDeflate` pass-through on `LinkClient` and `createHubServer`. Off by default - enable on trusted networks if you want compression.
+- **Backpressure.** New `maxBufferedBytes` option (default 4 MiB) on both client and hub. When `ws.bufferedAmount` exceeds the cap, status updates and fire-and-forget messages (`publish()`, `send()`) drop with a `'backpressure'` event; `rpc()` rejects synchronously with `BackpressureError` (`err.code === 'BACKPRESSURE'`); hub-side RPC forwards return an error response to the original caller.
+- **Bounded `hello` payload.** The hub now sanitizes each peer's hello to a whitelist of `kind` / `name` / `pid` / `startedAt`, dropping unknown fields and capping string lengths.
+- **`makeMsg` deep-clones `data`.** Reverts the v0.3.2 reference-passing behavior. Callers may now freely mutate the input after calling `makeMsg` without affecting the signed envelope. Internally uses `structuredClone`, which is faster than the old JSON round-trip. Note: `data` must remain `structuredClone`-compatible (functions, class instances with methods, and DOM nodes will throw) **and** JSON-round-trippable for the wire to carry it correctly. `Date` becomes its ISO string on the wire (via `toJSON`); `Map`/`Set`/`Uint8Array` lose their identity to plain `{}`/`[]` after JSON. Serialize exotic types yourself if the receiver needs to reconstruct them.
+- **`link.topic.list` and `link.health` server RPCs.** Built-in introspection: `await link.rpc('server', 'link.topic.list', { topic })` returns subscribers; `link.health` returns the hub-side snapshot.
+- **Bug fix: peer-routed RPC.** `rpc.response` is now exempt from the id-replay check on both client and hub. The old behavior caused responses to be dropped because they carry the same `id` as the request that was already added to the recent-id cache; peer-routed RPCs (e.g. `cli → secs`) silently timed out as a result. The timestamp-window check still applies - only the id check changes for response messages.
+- **Bug fix: `hello.ack ok:false` reconnect-backoff.** Reconnect backoff used to reset on the first verified message - *including* a `hello.ack` with `ok: false`. A client with a wrong secret could therefore hammer the hub at the initial reconnect interval indefinitely. The reset is now driven by the new `'ready'` transition (i.e. the hub *accepting* the hello). On rejection, the client by default also `stop()`s itself.
+- **Bug fix: `start()`/`stop()` race.** `start()` now also recognizes `CLOSING`/`CLOSED` socket states and detaches the orphan socket's listeners before opening a new connection; `stop()` does the same up front. Without this, racing `stop()` then `start()` could leave a stale closing socket whose `close` handler fired *after* the new connection was up, scheduling a duplicate reconnect timer or clearing timers belonging to the new socket. *(since v0.4.0)*
+
+**Behavior changes worth flagging on upgrade:**
+
+1. The hub stores only the sanitized hello, not the raw `msg.data`. Code that read non-whitelisted fields off `peer.hello` in `/state` or `getState()` will now see them missing. If you need extra hello fields, raise an issue - they were never part of the documented surface.
+2. `makeMsg(secret, { data })` no longer references `data` directly. Code that called `makeMsg` and then mutated the original to alter the envelope (which always violated the docs) needs to mutate the *returned* `msg.data` instead.
+3. The `'verified'` event payload no longer includes `features` - `features` moved to the new `'ready'` event (which is the connection-acceptance gate). Existing handlers that destructured only `kind` are unaffected. `link.hubFeatures` continues to work.
+4. `subscribe()` / `publish()` / `send()` now require `'ready'` rather than just `'verified'`. With shared-secret hubs (which always accept correctly-signed hellos) there is no observable difference; with per-peer-keys hubs, the new gate prevents publishing into a connection that's about to be rejected. The recommended pattern is `await link.ready()` after `start()`.
+5. `hello.ack ok:false` now triggers a client-side `stop()` by default rather than reconnecting forever. Set `reconnectOnRejection: true` to keep retrying with growing backoff.
+6. `rpc()` rejections are now typed-error instances rather than plain `Error` - including remote-handler errors, which produce `RpcRemoteError`. Existing `Error.message` strings are unchanged, so `e.message.includes('timeout')` keeps working - but `e instanceof RpcTimeoutError` (or `e.code === 'RPC_TIMEOUT'`) is the recommended pattern going forward.
+7. `publish()` and `send()` now throw `LinkNotReadyError` / `FeatureUnsupportedError` (both extend `LinkError`) instead of plain `Error`. The error messages are unchanged, so substring-matching catches keep working; `instanceof` is the recommended new-code pattern.
+
 ## Examples
 
-The repo's [`examples/`](https://github.com/Presenc3/link-core/tree/main/examples) directory has a runnable four-service deployment that exercises every primitive: a hub (with per-peer keys), a secrets vault, a worker that bootstraps its credentials from the vault, and a coordinator that dispatches jobs and listens for progress. See [`examples/README.md`](https://github.com/Presenc3/link-core/tree/main/examples/README.md) for the topology and how to run them.
+The repo's [`examples/`](https://github.com/Presenc3/link-core/tree/main/examples) directory has two layers:
+
+1. **A runnable four-service deployment** (`01-hub`, `02-vault`, `03-worker`, `04-coordinator`) that exercises every protocol primitive end-to-end: a hub with per-peer keys, a secrets vault, a worker that bootstraps its credentials from the vault using `waitForPeer` + `rpcWithRetry`, and a coordinator that dispatches jobs and listens for progress.
+2. **Standalone single-file showcases** that each isolate one v0.5 helper:
+   - `05-disabled-mode` - the "no link bus" local-dev pattern, with `link.ready()` rejecting fast and `createSafePublisher` no-op'ing on a disabled link.
+   - `06-dashboard` - `createEventRecorder` + SSE for a live bus-state dashboard, with `createLogger` passed directly as `logger`.
+   - `07-loadsecrets-vault` + `08-loadsecrets-consumer` - the `loadSecrets({ watch: true })` wire convention end-to-end, with rotation events visible.
+   - `09-graceful-shutdown` - `createGracefulShutdown` + `installProcessHandlers` orchestrating a multi-resource cleanup.
+
+See [`examples/README.md`](https://github.com/Presenc3/link-core/tree/main/examples/README.md) for the topology and how to run them.
 
 ## License
 

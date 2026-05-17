@@ -3,7 +3,7 @@
 const { test } = require('node:test');
 const assert   = require('node:assert');
 
-const { RecentIds } = require('../src/util/recent.js');
+const { RecentIds } = require('../../src/internal/recent.js');
 
 test('ctor rejects non-positive maxAgeMs', () => {
   assert.throws(() => new RecentIds({ maxAgeMs: 0,    maxCount: 10 }), /maxAgeMs/);

@@ -5,7 +5,6 @@ export const {
   createHubServer,
 
   LinkClient,
-  LinkBusClient,
 
   sign,
   verify,
@@ -29,6 +28,29 @@ export const {
   RpcDisconnectError,
   HelloRejectedError,
   FeatureUnsupportedError,
+
+  num,
+  bool,
+  LEVELS,
+  requireEnv,
+  loadSecrets,
+  waitForPeer,
+  createLogger,
+  rpcWithRetry,
+  createSafeSend,
+  createSafePublisher,
+  LOADED_SECRETS_UNWATCH,
+  attachHubObservability,
+  installProcessHandlers,
+  createGracefulShutdown,
+  linkClientOptionsFromEnv,
+  attachClientObservability,
+  DEFAULT_HUB_CONCERNING_REASONS,
+  DEFAULT_CLIENT_CONCERNING_REASONS,
+
+  SNAPSHOT_TRIGGERS,
+  createEventRecorder,
+  RECORDED_CLIENT_EVENTS,
 } = linkCore;
 
 export default linkCore;

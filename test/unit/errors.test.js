@@ -8,7 +8,7 @@ const {
   RpcAbortError, RpcRemoteError, RpcTimeoutError, RpcDisconnectError,
   BackpressureError, ProtocolError, HelloRejectedError,
   LinkNotReadyError, FeatureUnsupportedError,
-} = require('../src/index.js');
+} = require('../../src/index.js');
 
 test('every typed error extends Error and LinkError', () => {
   for (const Cls of [

@@ -1,0 +1,722 @@
+'use strict';
+
+const   WebSocket      = require('ws');
+const { randomUUID   } = require('crypto');
+const { EventEmitter } = require('events');
+
+const {
+  TAG,
+  DEFAULT_RPC_TIMEOUT_MS,
+  DEFAULT_MAX_RECENT_IDS,
+  DEFAULT_RECONNECT_GROWTH,
+  DEFAULT_RECONNECT_JITTER,
+  DEFAULT_RECONNECT_MAX_MS,
+  DEFAULT_REPLAY_WINDOW_MS,
+  DEFAULT_MAX_MESSAGE_BYTES,
+  DEFAULT_STATUS_INTERVAL_MS,
+  DEFAULT_MAX_BUFFERED_BYTES,
+  DEFAULT_RECONNECT_INITIAL_MS,
+  DEFAULT_HELLO_ACK_DIAGNOSTIC_MS
+} = require('./constants.js');
+
+const { handleInboundMessage, handleClose } = require('./inbound.js');
+
+const {
+  makeMsg, assertValidTopic, DEFAULT_HASH_ALGO,
+} = require('../protocol.js');
+
+const {
+  RpcAbortError,
+  RpcTimeoutError,       RpcDisconnectError,
+  BackpressureError,     HelloRejectedError,
+  LinkNotReadyError,     FeatureUnsupportedError,
+} = require('../internal/errors.js');
+
+const { RecentIds } = require('../internal/recent.js');
+const { noopLogger, consoleLogger } = require('../internal/logger.js');
+const {
+  positiveFinite, nonNegFinite, inRange, atLeast,
+} = require('../internal/options.js');
+
+class LinkClient extends EventEmitter {
+  constructor({
+    url, secret, kind, name,
+    makeStatus,
+    rpcHandlers = {},
+    logger,
+    perMessageDeflate     = false,
+    reconnectOnRejection  = false,
+    hashAlgo              = DEFAULT_HASH_ALGO,
+    maxRecentIds,
+    reconnectMaxMs,
+    replayWindowMs,
+    reconnectGrowth,
+    reconnectJitter,
+    maxMessageBytes,
+    maxBufferedBytes,
+    statusIntervalMs,
+    reconnectInitialMs,
+    defaultRpcTimeoutMs,
+    helloAckDiagnosticMs,
+  } = {}) {
+    super();
+    maxRecentIds          = positiveFinite(maxRecentIds,         DEFAULT_MAX_RECENT_IDS,          'maxRecentIds');
+    reconnectMaxMs        = positiveFinite(reconnectMaxMs,       DEFAULT_RECONNECT_MAX_MS,        'reconnectMaxMs');
+    replayWindowMs        = nonNegFinite(replayWindowMs,         DEFAULT_REPLAY_WINDOW_MS,        'replayWindowMs');
+    maxMessageBytes       = positiveFinite(maxMessageBytes,      DEFAULT_MAX_MESSAGE_BYTES,       'maxMessageBytes');
+    reconnectGrowth       = atLeast(reconnectGrowth,             DEFAULT_RECONNECT_GROWTH, 1,     'reconnectGrowth');
+    reconnectJitter       = inRange(reconnectJitter,             DEFAULT_RECONNECT_JITTER, 0, 1,  'reconnectJitter');
+    statusIntervalMs      = positiveFinite(statusIntervalMs,     DEFAULT_STATUS_INTERVAL_MS,      'statusIntervalMs');
+    maxBufferedBytes      = positiveFinite(maxBufferedBytes,     DEFAULT_MAX_BUFFERED_BYTES,      'maxBufferedBytes');
+    reconnectInitialMs    = positiveFinite(reconnectInitialMs,   DEFAULT_RECONNECT_INITIAL_MS,    'reconnectInitialMs');
+    defaultRpcTimeoutMs   = positiveFinite(defaultRpcTimeoutMs,  DEFAULT_RPC_TIMEOUT_MS,          'defaultRpcTimeoutMs');
+    helloAckDiagnosticMs  = nonNegFinite(helloAckDiagnosticMs,   DEFAULT_HELLO_ACK_DIAGNOSTIC_MS, 'helloAckDiagnosticMs');
+
+    this.url         = url;
+    this.kind        = kind;
+    this.secret      = secret;
+    this.makeStatus  = makeStatus;
+    this.name        = name || kind;
+    this.rpcHandlers = Object.assign({}, rpcHandlers || {});
+    this.log         = logger === null ? noopLogger : (logger || consoleLogger);
+
+    this.hashAlgo             = hashAlgo;
+    this.reconnectMaxMs       = reconnectMaxMs;
+    this.replayWindowMs       = replayWindowMs;
+    this.reconnectGrowth      = reconnectGrowth;
+    this.reconnectJitter      = reconnectJitter;
+    this.maxMessageBytes      = maxMessageBytes;
+    this.statusIntervalMs     = statusIntervalMs;
+    this.maxBufferedBytes     = maxBufferedBytes;
+    this.perMessageDeflate    = perMessageDeflate;
+    this.reconnectInitialMs   = reconnectInitialMs;
+    this.defaultRpcTimeoutMs  = defaultRpcTimeoutMs;
+    this.helloAckDiagnosticMs = helloAckDiagnosticMs;
+    this.reconnectOnRejection = reconnectOnRejection;
+
+    this.recentIds = (replayWindowMs > 0) ? new RecentIds({
+      maxCount: maxRecentIds,
+      maxAgeMs: replayWindowMs
+    }) : null;
+
+    this._reconnectAttempt = 0;
+    this.peers             = [];
+    this.hubFeatures       = null;
+    this.ws                = null;
+    this.statusTimer       = null;
+    this.reconnectTimer    = null;
+    this.helloAckTimer     = null;
+    this._lastVerifiedAt   = null;
+    this._stopped          = false;
+    this._verifiedAny      = false;
+    this._ready            = false;
+    this.pending           = new Map();
+    this.lastStatusByPeer  = new Map();
+    this._subscriptions    = new Map();
+    this.reconnectMs       = reconnectInitialMs;
+  }
+
+  start() {
+    if (!this.url || !this.secret || !this.kind
+     ) return this.log.warn(TAG, 'start(): disabled (missing url/secret/kind)');
+
+    if (this.ws) {
+      const state = this.ws.readyState;
+
+      if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+        this._stopped = false;
+        return;
+      }
+
+      this._detachWs(this.ws);
+      this.ws = null;
+    }
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    this._stopped = false;
+    this._connect();
+  }
+
+  stop() {
+    const wasReady = this._ready;
+
+    this._stopped     = true;
+    this._ready       = false;
+    this._verifiedAny = false;
+    this.hubFeatures  = null;
+
+    if (this.ws) {
+      this._detachWs(this.ws);
+      try { this.ws.close(); } catch {}
+    }
+
+    if (this.statusTimer)    { clearInterval(this.statusTimer);    this.statusTimer    = null; }
+    if (this.reconnectTimer) { clearTimeout( this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.helloAckTimer)  { clearTimeout( this.helloAckTimer);  this.helloAckTimer  = null; }
+
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timeout);
+
+      if (p.cleanupAbort) p.cleanupAbort();
+
+      const err = new RpcDisconnectError('Link stopped before RPC completed', {
+        to: p.to, rpcType: p.rpcType, id: p.id,
+      });
+
+      p.reject(err);
+      this.emit('rpc.disconnect', { id: p.id, to: p.to, rpcType: p.rpcType });
+      this._emitRpcComplete(p, false, 'disconnect', err);
+    }
+
+    this.pending.clear();
+
+    if (wasReady) {
+      try {
+        this.emit('disconnect', {
+          reason:        'stopped',
+          willReconnect: false,
+          wasReady:      true,
+        });
+      } catch (e) {
+        this.log.warn(TAG, "'disconnect' listener threw on stop():", e?.message || e);
+      }
+    }
+  }
+
+  _detachWs(ws) {
+    if (!ws) return;
+
+    try { ws.removeAllListeners('open');    } catch {}
+    try { ws.removeAllListeners('close');   } catch {}
+    try { ws.removeAllListeners('message'); } catch {}
+    try { ws.removeAllListeners('error');   } catch {}
+    try { ws.on('error', () => {});         } catch {}
+  }
+
+  isConnected() { return !!this.ws && this.ws.readyState === WebSocket.OPEN; }
+  isReady()     { return this._ready; }
+
+  /**
+   * Returns a deep copy of the latest peer list. The returned array (and
+   * every object inside) is safe to mutate; callers cannot use it to
+   * pollute the LinkClient's internal state. Peer payloads always come
+   * over the wire (JSON-roundtripped) so `structuredClone` never throws
+   * here.
+   *
+   * Includes the calling client itself - the hub broadcasts the full
+   * membership snapshot. Filter on `p.kind !== this.kind` if you only
+   * want "everyone else".
+   */
+  getPeers() { return structuredClone(this.peers); }
+
+  /**
+   * Returns a deep copy of the last-known status for a peer of that
+   * kind, or `null`. Safe to mutate.
+   */
+  getPeerStatus(kind) {
+    const s = this.lastStatusByPeer.get(kind);
+    return s ? structuredClone(s) : null;
+  }
+
+  health() {
+    return {
+      ready             : this._ready,
+      stopped           : this._stopped,
+      verified          : this._verifiedAny,
+      peerCount         : this.peers.length,
+      pendingRpcCount   : this.pending.size,
+      connected         : this.isConnected(),
+      lastVerifiedAt    : this._lastVerifiedAt,
+      reconnectAttempt  : this._reconnectAttempt,
+      subscriptionCount : this._subscriptions.size,
+      bufferedAmount    : this.ws ? (this.ws.bufferedAmount || 0) : 0
+    };
+  }
+
+  send(to, type, data) {
+    if (typeof to !== 'string' || !to
+     ) throw new TypeError('send(to, type, data): "to" must be a non-empty string');
+
+    if (typeof type !== 'string' || !type
+     ) throw new TypeError('send(to, type, data): "type" must be a non-empty string');
+
+    if (!this.isConnected() || !this._ready
+     ) throw new LinkNotReadyError(
+      'Cannot send: link not connected/ready',
+      { op: 'send' },
+    );
+
+    if (Array.isArray(this.hubFeatures) && !this.hubFeatures.includes('direct')
+     ) throw new FeatureUnsupportedError(
+      'Cannot send: hub does not support directed fire-and-forget ' +
+      '(upgrade hub to v0.4+)',
+      { op: 'send', feature: 'direct' },
+    );
+
+    return this._send('direct', { directType: type, directData: data }, to) !== false;
+  }
+
+  publish(topic, payload) {
+    assertValidTopic(topic);
+
+    if (!this.isConnected() || !this._ready
+     ) throw new LinkNotReadyError(
+      'Cannot publish: link not connected/ready',
+      { op: 'publish' },
+    );
+
+    if (Array.isArray(this.hubFeatures) && !this.hubFeatures.includes('topics')
+     ) throw new FeatureUnsupportedError(
+      'Cannot publish: hub does not support topics (upgrade hub to v0.4+)',
+      { op: 'publish', feature: 'topics' },
+    );
+
+    return this._send('topic.message', { topic, payload }) !== false;
+  }
+
+  subscribe(topic, handler) {
+    assertValidTopic(topic);
+
+    if (typeof handler !== 'function'
+     ) throw new TypeError('subscribe(topic, handler): handler must be a function');
+
+    let handlers = this._subscriptions.get(topic);
+    const isFirst = !handlers;
+
+    if (isFirst) {
+      handlers = new Set();
+      this._subscriptions.set(topic, handlers);
+    }
+
+    handlers.add(handler);
+
+    if (isFirst && this.isConnected() && this._ready
+     ) this._send('topic.subscribe', { topic });
+  }
+
+  unsubscribe(topic, handler) {
+    const handlers = this._subscriptions.get(topic);
+    if (!handlers) return false;
+
+    if (handler) {
+      const removed = handlers.delete(handler);
+      if (handlers.size > 0) return removed;
+    }
+
+    this._subscriptions.delete(topic);
+
+    if (this.isConnected() && this._ready
+     ) this._send('topic.unsubscribe', { topic });
+
+    return true;
+  }
+
+  handle(rpcType, fn) {
+    if (typeof rpcType !== 'string' || !rpcType
+     ) throw new TypeError('handle(rpcType, fn): "rpcType" must be a non-empty string');
+
+    if (typeof fn !== 'function'
+     ) throw new TypeError('handle(rpcType, fn): "fn" must be a function');
+
+    const prev = this.rpcHandlers[rpcType];
+    this.rpcHandlers[rpcType] = fn;
+
+    return prev;
+  }
+
+  unhandle(rpcType) {
+    if (!this.rpcHandlers || !Object.hasOwn(this.rpcHandlers, rpcType)) return false;
+    delete this.rpcHandlers[rpcType];
+    return true;
+  }
+
+  waitFor(event, opts = {}) {
+    const { signal } = opts;
+    const timeoutMs = nonNegFinite(opts.timeoutMs, 0, 'waitFor(): opts.timeoutMs');
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer   = null;
+      let onAbort = null;
+
+      const cleanup = () => {
+        settled = true;
+
+        if (timer) clearTimeout(timer);
+        try { this.off(event, onEvent); } catch {}
+
+        if (onAbort && signal) {
+          try { signal.removeEventListener('abort', onAbort); } catch {}
+        }
+      };
+
+      const onEvent = (...args) => {
+        if (settled) return;
+        cleanup();
+        resolve(args.length <= 1 ? args[0] : args);
+      };
+
+      this.on(event, onEvent);
+
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (settled) return;
+
+          cleanup();
+          reject(new Error(`waitFor('${event}') timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+
+      if (signal) {
+        if (signal.aborted) {
+          cleanup();
+
+          const err = new Error(`waitFor('${event}') aborted`);
+          err.name = 'AbortError';
+
+          reject(err);
+          return;
+        }
+
+        onAbort = () => {
+          if (settled) return;
+
+          cleanup();
+
+          const err = new Error(`waitFor('${event}') aborted`);
+          err.name = 'AbortError';
+
+          reject(err);
+        };
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  ready(opts = {}) {
+    const { signal } = opts;
+    const timeoutMs = nonNegFinite(opts.timeoutMs, 0, 'ready(): opts.timeoutMs');
+
+    if (this._ready
+     ) return Promise.resolve({ kind: this.kind, features: this.hubFeatures });
+
+    if (!this.url || !this.secret || !this.kind) {
+      return Promise.reject(new LinkNotReadyError(
+        'ready(): link is disabled (missing url, secret, or kind) - ' +
+        'configure all three or skip ready() in disabled-mode code paths',
+        { op: 'ready' },
+      ));
+    }
+
+    if (signal && signal.aborted) {
+      const err = new Error(`ready() aborted`);
+      err.name = 'AbortError';
+
+      return Promise.reject(err);
+    }
+
+    if (this._stopped) {
+      return Promise.reject(new LinkNotReadyError(
+        'ready(): link has been stopped - call start() to reconnect',
+        { op: 'ready' },
+      ));
+    }
+
+    if (!this.ws && !this._stopped) this.start();
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer   = null;
+      let onAbort = null;
+
+      const cleanup = () => {
+        settled = true;
+
+        if (timer) clearTimeout(timer);
+
+        this.off('ready',    onReady);
+        this.off('rejected', onRejected);
+
+        if (onAbort && signal) {
+          try { signal.removeEventListener('abort', onAbort); } catch {}
+        }
+      };
+
+      const onReady = (info) => {
+        if (settled) return;
+
+        cleanup();
+        resolve(info);
+      };
+
+      const onRejected = (info) => {
+        if (settled) return;
+
+        cleanup();
+
+        reject(new HelloRejectedError(
+          info?.error || 'Hub rejected hello',
+          { reason: info?.error || null },
+        ));
+      };
+
+      this.on('ready',    onReady);
+      this.on('rejected', onRejected);
+
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (settled) return;
+
+          cleanup();
+          reject(new Error(`ready() timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+
+      if (signal) {
+        onAbort = () => {
+          if (settled) return;
+
+          cleanup();
+
+          const err = new Error('ready() aborted');
+          err.name = 'AbortError';
+          reject(err);
+        };
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  rpc(to, rpcType, rpcData, optsOrTimeoutMs) {
+    if (typeof to !== 'string' || !to
+     ) throw new TypeError('rpc(to, rpcType, rpcData, opts?): "to" must be a non-empty string');
+
+    if (typeof rpcType !== 'string' || !rpcType
+     ) throw new TypeError('rpc(to, rpcType, rpcData, opts?): "rpcType" must be a non-empty string');
+
+    const opts = (typeof optsOrTimeoutMs === 'number')
+      ? { timeoutMs: optsOrTimeoutMs }
+      : (optsOrTimeoutMs || {});
+
+    const timeoutMs = nonNegFinite(
+      opts.timeoutMs, this.defaultRpcTimeoutMs, 'rpc(): opts.timeoutMs',
+    );
+
+    const signal    = opts.signal;
+    const id        = randomUUID();
+    const startedAt = Date.now();
+    const tele      = { id, to, rpcType, startedAt };
+
+    if (signal && signal.aborted) {
+      const err = new RpcAbortError(
+        `RPC aborted before send: ${to}:${rpcType}`,
+        { to, rpcType, id },
+      );
+
+      this.emit('rpc.abort', { id, to, rpcType });
+      this._emitRpcComplete(tele, false, 'abort', err);
+
+      return Promise.reject(err);
+    }
+
+    if (!this.isConnected() || !this._ready) {
+      const err = new LinkNotReadyError(
+        'Cannot rpc: link not connected/ready',
+        { op: 'rpc' },
+      );
+
+      err.to      = to;
+      err.rpcType = rpcType;
+      err.id      = id;
+
+      this._emitRpcComplete(tele, false, 'not-ready', err);
+
+      return Promise.reject(err);
+    }
+
+    if (this.ws.bufferedAmount > this.maxBufferedBytes) {
+      this.emit('backpressure', {
+        type: 'rpc.request',
+        rpcType, to,
+        bufferedAmount: this.ws.bufferedAmount,
+      });
+
+      const err = new BackpressureError(
+        `RPC backpressure: hub send buffer full ` +
+        `(${this.ws.bufferedAmount} > ${this.maxBufferedBytes} bytes): ${to}:${rpcType}`,
+        {
+          type: 'rpc.request', to, rpcType, id,
+          bufferedAmount:   this.ws.bufferedAmount,
+          maxBufferedBytes: this.maxBufferedBytes,
+        },
+      );
+
+      this._emitRpcComplete(tele, false, 'backpressure', err);
+
+      return Promise.reject(err);
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = timeoutMs > 0 ? setTimeout(() => {
+        const p = this.pending.get(id);
+
+        this.pending.delete(id);
+        if (p?.cleanupAbort) p.cleanupAbort();
+
+        this.emit('rpc.timeout', { id, to, rpcType, timeoutMs });
+
+        const err = new RpcTimeoutError(
+          `RPC timeout after ${timeoutMs}ms: ${to}:${rpcType}`,
+          { to, rpcType, id, timeoutMs },
+        );
+
+        this._emitRpcComplete(tele, false, 'timeout', err);
+
+        reject(err);
+      }, timeoutMs) : null;
+
+      timeout?.unref?.();
+
+      let cleanupAbort = null;
+
+      if (signal) {
+        const onAbort = () => {
+          if (!this.pending.has(id)) return;
+
+          clearTimeout(timeout);
+          this.pending.delete(id);
+
+          const err = new RpcAbortError(
+            `RPC aborted: ${to}:${rpcType}`,
+            { to, rpcType, id },
+          );
+
+          this.emit('rpc.abort', { id, to, rpcType });
+          this._emitRpcComplete(tele, false, 'abort', err);
+
+          reject(err);
+        };
+
+        signal.addEventListener('abort', onAbort, { once: true });
+
+        cleanupAbort = () => {
+          try { signal.removeEventListener('abort', onAbort); } catch {}
+        };
+      }
+
+      this.pending.set(id, { resolve, reject, timeout, to, rpcType, id, startedAt, cleanupAbort });
+
+      const msg = makeMsg(this.secret, {
+        id, type: 'rpc.request', from: this.kind, to,
+        data: { rpcType, rpcData },
+      }, this.hashAlgo);
+
+      try {
+        this.ws.send(JSON.stringify(msg));
+      } catch (e) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        if (cleanupAbort) cleanupAbort();
+        this._emitRpcComplete(tele, false, 'send-error', e);
+        reject(e);
+      }
+    });
+  }
+
+  _emitRpcComplete(p, ok, reason, err) {
+    try {
+      this.emit('rpc.complete', {
+        id:        p.id,
+        to:        p.to,
+        rpcType:   p.rpcType,
+        ok,
+        reason,
+        durationMs: Date.now() - p.startedAt,
+        error:     ok ? null : (err?.message || String(err || '')),
+      });
+    } catch (e) {
+      this.log.warn(TAG, 'rpc.complete listener threw:', e?.message || e);
+    }
+  }
+
+  async _handleRpcRequest(msg) {
+    const { rpcType, rpcData } = msg.data || {};
+    const type = String(rpcType || '');
+
+    try {
+      const handler = this.rpcHandlers[type];
+      if (!handler) throw new Error(`Unknown rpcType: ${type}`);
+
+      const result = await handler(rpcData, msg);
+      this._send('rpc.response', { ok: true, result }, msg.from, msg.id);
+    } catch (e) {
+      this._send('rpc.response', { ok: false, error: e?.message || String(e) }, msg.from, msg.id);
+    }
+  }
+
+  _send(type, data, to = null, id = randomUUID()) {
+    if (!this.isConnected()) return false;
+
+    if (this.ws.bufferedAmount > this.maxBufferedBytes) {
+      this.log.warn(TAG, `dropped: backpressure (type=${type}, buffered=${this.ws.bufferedAmount} > ${this.maxBufferedBytes})`);
+      this.emit('backpressure', { type, to, bufferedAmount: this.ws.bufferedAmount });
+      return false;
+    }
+
+    const msg = makeMsg(this.secret, { id, type, from: this.kind, to, data }, this.hashAlgo);
+    try { this.ws.send(JSON.stringify(msg)); return true; }
+    catch (e) { this.log.warn(TAG, `_send(${type}) failed:`, e?.message || e); return false; }
+  }
+
+  _connect() {
+    this.ws = new WebSocket(this.url, {
+      maxPayload:        this.maxMessageBytes,
+      perMessageDeflate: this.perMessageDeflate,
+    });
+
+    this.ws.on('open', () => {
+      this._verifiedAny = false;
+      this._ready       = false;
+      this.hubFeatures  = null;
+
+      this._send('hello', {
+        kind: this.kind, name: this.name,
+        pid: process.pid, startedAt: Date.now(),
+      });
+
+      if (this.helloAckDiagnosticMs > 0) {
+        if (this.helloAckTimer) clearTimeout(this.helloAckTimer);
+        this.helloAckTimer = setTimeout(() => {
+          this.helloAckTimer = null;
+          if (!this._verifiedAny && this.isConnected()) {
+            this.log.warn(TAG, `no verified message within ${this.helloAckDiagnosticMs}ms of connect - likely secret mismatch with the hub`);
+            this.emit('protocol-error', { reason: 'no-ack' });
+          }
+        }, this.helloAckDiagnosticMs);
+        this.helloAckTimer.unref?.();
+      }
+
+      this.log.log(TAG, `connected (${this.kind}) -> ${this.url}`);
+      this.emit('connect', { url: this.url, kind: this.kind });
+    });
+
+    this.ws.on('message', (raw) => handleInboundMessage(this, raw));
+
+    this.ws.on('error', (e) => {
+      this.log.warn(TAG, `ws error (${this.kind}):`, e?.message || e);
+      this.emit('ws-error', e);
+    });
+
+    this.ws.on('close', (code, reason) => handleClose(this, code, reason));
+  }
+}
+
+module.exports = { LinkClient };

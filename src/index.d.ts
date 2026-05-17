@@ -17,14 +17,14 @@ export const DEFAULT_HASH_ALGO: 'sha256';
 
 /** A signed message envelope as it appears on the wire. */
 export interface MessageEnvelope<TData = unknown> {
-  v:    number;
-  id:   string;
-  ts:   number;
-  type: string;
-  from: string | null;
-  to:   string | null;
-  data: TData;
-  sig:  string;
+  v    : number;
+  id   : string;
+  ts   : number;
+  type : string;
+  from : string | null;
+  to   : string | null;
+  data : TData;
+  sig  : string;
 }
 
 /**
@@ -38,16 +38,16 @@ export interface Logger {
 
 /** A peer description as it appears in `peers.update` and `getState()`. */
 export interface PeerInfo {
-  kind:        string;
-  hello:       unknown | null;
-  connectedAt: number  | null;
-  connected:   boolean;
+  kind        : string;
+  hello       : unknown | null;
+  connectedAt : number  | null;
+  connected   : boolean;
 }
 
 /** A peer's last-known status as remembered by the hub. */
 export interface PeerStatus {
-  status: unknown;
-  at:     number;
+  status : unknown;
+  at     : number;
 }
 
 /**
@@ -58,8 +58,8 @@ export interface PeerStatus {
  * socket's bound `kind` (since v0.3.2) - safe to use for authorization.
  */
 export type RpcHandler<TIn = any, TOut = any> = (
-  data: TIn,
-  msg:  MessageEnvelope<{ rpcType: string; rpcData: TIn }>,
+  data : TIn,
+  msg  : MessageEnvelope<{ rpcType: string; rpcData: TIn }>,
 ) => Promise<TOut> | TOut;
 
 /**
@@ -105,8 +105,17 @@ export function sign(secret: string, msg: object, algo?: string): string;
  */
 export function verify(secret: string, msg: unknown, algo?: string): boolean;
 
-/** Deterministic JSON stringifier with sorted keys. Used for stable signing. */
-export function stableStringify(obj: unknown): string;
+/**
+ * Deterministic JSON stringifier with sorted keys. Used for stable signing.
+ *
+ * Mirrors `JSON.stringify` for top-level values: returns `undefined` (not
+ * the string `"undefined"`) when the value can't be represented in JSON -
+ * i.e. when the input is itself `undefined`, a function, or a symbol.
+ * Recursive non-serializable values throw `TypeError`. Same `toJSON()`
+ * support, sorted-keys for objects, `null` for non-serializable array
+ * slots.
+ */
+export function stableStringify(obj: unknown): string | undefined;
 
 /** Maximum permitted topic length, in characters. */
 export const TOPIC_MAX_LENGTH: number;
@@ -125,8 +134,8 @@ export function assertValidTopic(topic: unknown): asserts topic is string;
  * safe to use for routing/authorization decisions.
  */
 export type TopicHandler<TPayload = unknown> = (
-  payload: TPayload,
-  msg:     MessageEnvelope<{ topic: string; payload: TPayload }>,
+  payload : TPayload,
+  msg     : MessageEnvelope<{ topic: string; payload: TPayload }>,
 ) => void | Promise<void>;
 
 /**
@@ -145,9 +154,12 @@ export type TopicHandler<TPayload = unknown> = (
  *   - `no-ack`             - client-only: saw no verified message within
  *                            `helloAckDiagnosticMs` (likely secret mismatch).
  *   - `bad-hello`          - hub-only: hello arrived with a missing,
- *                            oversized, or pattern-failing `kind`. The
- *                            `detail` field disambiguates: `'missing-kind'`,
- *                            `'oversized-kind'`, or `'invalid-kind'`.
+ *                            oversized, pattern-failing, or reserved
+ *                            `kind`. The `detail` field disambiguates:
+ *                            `'missing-kind'`, `'oversized-kind'`,
+ *                            `'invalid-kind'`, or `'reserved-kind'`
+ *                            (`__proto__` / `constructor` / `prototype` /
+ *                            `server`).
  *   - `duplicate-hello`    - hub-only: a second hello arrived on a socket
  *                            that was already authenticated by a prior
  *                            (concurrent) hello.
@@ -201,13 +213,13 @@ export type HubProtocolErrorReason =
 
 /** Common payload shape for `'protocol-error'` events. */
 export interface ProtocolErrorInfoBase {
-  reason: ProtocolErrorReason;
-  type?: string;
-  msg?: MessageEnvelope;
-  size?: number;
-  skew?: number;
+  reason:  ProtocolErrorReason;
+  type?:   string;
+  msg?:    MessageEnvelope;
+  size?:   number;
+  skew?:   number;
   detail?: string;
-  error?: Error;
+  error?:  Error;
 }
 
 /** Client-emitted `'protocol-error'` payload. `kind` is never present. */
@@ -217,10 +229,15 @@ export interface ClientProtocolErrorInfo extends ProtocolErrorInfoBase {
 
 /** Hub-emitted `'protocol-error'` payload. `kind` is the authenticated
  *  kind on the offending socket, or `null` if the socket hadn't completed
- *  hello yet. */
+ *  hello yet.
+ *
+ *  When `reason === 'bad-hello'`, `detail` narrows to one of
+ *  `'missing-kind' | 'oversized-kind' | 'invalid-kind' | 'reserved-kind'`.
+ *  For all other reasons, `detail` is absent. */
 export interface HubProtocolErrorInfo extends ProtocolErrorInfoBase {
-  reason: HubProtocolErrorReason;
-  kind: string | null;
+  reason : HubProtocolErrorReason;
+  kind   : string | null;
+  detail?: 'missing-kind' | 'oversized-kind' | 'invalid-kind' | 'reserved-kind';
 }
 
 /** @deprecated Use `ClientProtocolErrorInfo` or `HubProtocolErrorInfo`
@@ -263,25 +280,25 @@ export class LinkError extends Error {
 
 /** Common base for everything `rpc()` rejects with locally. */
 export class RpcError extends LinkError {
-  to?: string;
+  to?:      string;
   rpcType?: string;
-  id?: string;
+  id?:      string;
   constructor(message: string, opts?: {
-    code?: LinkErrorCode;
-    to?: string;
+    code?:    LinkErrorCode;
+    to?:      string;
     rpcType?: string;
-    id?: string;
+    id?:      string;
   });
 }
 
 /** `rpc()` did not receive a response within `timeoutMs`. */
 export class RpcTimeoutError extends RpcError {
-  code: 'RPC_TIMEOUT';
+  code:       'RPC_TIMEOUT';
   timeoutMs?: number;
   constructor(message: string, opts?: {
-    to?: string;
-    rpcType?: string;
-    id?: string;
+    to?:        string;
+    rpcType?:   string;
+    id?:        string;
     timeoutMs?: number;
   });
 }
@@ -332,19 +349,19 @@ export class RpcRemoteError extends RpcError {
  * for stable duck-typing across package boundaries.
  */
 export class BackpressureError extends LinkError {
-  code: 'BACKPRESSURE';
-  type?: string;
-  to?: string;
-  rpcType?: string;
-  id?: string;
-  bufferedAmount?: number;
+  code:             'BACKPRESSURE';
+  type?:             string;
+  to?:               string;
+  rpcType?:          string;
+  id?:               string;
+  bufferedAmount?:   number;
   maxBufferedBytes?: number;
   constructor(message: string, opts?: {
-    type?: string;
-    to?: string;
-    rpcType?: string;
-    id?: string;
-    bufferedAmount?: number;
+    type?:             string;
+    to?:               string;
+    rpcType?:          string;
+    id?:               string;
+    bufferedAmount?:   number;
     maxBufferedBytes?: number;
   });
 }
@@ -359,7 +376,7 @@ export class BackpressureError extends LinkError {
  */
 export class LinkNotReadyError extends LinkError {
   code: 'LINK_NOT_READY';
-  op?: string;
+  op?:   string;
   constructor(message: string, opts?: { op?: string });
 }
 
@@ -375,9 +392,9 @@ export class LinkNotReadyError extends LinkError {
  * into a hub that won't act on it.
  */
 export class FeatureUnsupportedError extends LinkError {
-  code: 'FEATURE_UNSUPPORTED';
-  feature?: string;
-  op?: string;
+  code:     'FEATURE_UNSUPPORTED';
+  feature?:  string;
+  op?:       string;
   constructor(message: string, opts?: { feature?: string; op?: string });
 }
 
@@ -387,8 +404,8 @@ export class FeatureUnsupportedError extends LinkError {
  * available for callers that need to throw rather than emit.
  */
 export class ProtocolError extends LinkError {
-  code: 'PROTOCOL_ERROR';
-  reason?: ProtocolErrorReason;
+  code:    'PROTOCOL_ERROR';
+  reason?:  ProtocolErrorReason;
   constructor(message: string, opts?: {
     reason?: ProtocolErrorReason;
   });
@@ -405,29 +422,37 @@ export class ProtocolError extends LinkError {
  * `LinkClientOptions.reconnectOnRejection: true`.
  */
 export class HelloRejectedError extends LinkError {
-  code: 'HELLO_REJECTED';
-  reason?: string | null;
+  code:    'HELLO_REJECTED';
+  reason?:  string | null;
   constructor(message: string, opts?: { reason?: string | null });
 }
 
 export interface LinkClientOptions {
-  /** Hub WebSocket URL, e.g. `ws://localhost:8080`. */
-  url:    string;
+  /**
+   * Hub WebSocket URL, e.g. `ws://localhost:8080`. Optional: if omitted
+   * (or `secret`/`kind` are omitted), `start()` becomes a no-op and logs
+   * a `disabled (missing url/secret/kind)` warning. This is useful in
+   * service templates that share a code path between a "real" run and a
+   * "no link bus" local dev mode driven by env vars.
+   */
+  url?:    string;
   /**
    * The HMAC secret this client signs with and verifies the hub's messages
    * against. In shared-secret deployments this is the same string for every
    * peer. In per-peer-keys deployments this is THIS peer's key only - the
    * client never sees other peers' keys; the hub re-signs each fan-out
-   * with the recipient's key.
+   * with the recipient's key. Optional - see the `url` note above for the
+   * "disabled if missing" behavior.
    */
-  secret: string;
+  secret?: string;
   /**
    * Service-type identifier; e.g. `'worker'`. Singleton per hub. Must
    * match `[a-zA-Z0-9._-]+`, length 1–256 (same character class as topics);
    * the hub will reject the hello as `'bad-hello'` (`detail: 'invalid-kind'`)
-   * otherwise.
+   * otherwise. Optional - see the `url` note above for the "disabled if
+   * missing" behavior.
    */
-  kind:   string;
+  kind?:   string;
   /** Human-readable instance name. Defaults to `kind`. */
   name?:  string;
 
@@ -600,6 +625,17 @@ export interface LinkClientEvents {
   /** A peer kind disappeared from the latest `peers.update`. */
   'peer.disconnect': (peer: PeerInfo) => void;
 
+  /**
+   * A peer of the same `kind` reconnected with a fresh socket (the hub
+   * replaced the old binding mid-flight). Fires *after* the internal
+   * `peers` state has been updated, so `link.getPeers()` from inside
+   * the handler reflects the new connectedAt. Useful for tearing down
+   * per-connection state (cached capabilities probed via hello, etc.)
+   * without having to infer replacement from a `disconnect`/`connect`
+   * pair that never fires (the kind never leaves the set). Since v0.5.
+   */
+  'peer.replaced':   (info: { kind: string; prevPeer: PeerInfo; peer: PeerInfo }) => void;
+
   /** A peer broadcast a status update. */
   'peer.status':     (info: { from: string; status: unknown; at: number }) => void;
 
@@ -766,9 +802,16 @@ export interface HealthSnapshot {
 }
 
 export class LinkClient extends EventEmitter {
-  readonly url    : string;
-  readonly secret : string;
-  readonly kind   : string;
+  /**
+   * The hub URL the client was constructed with, or `undefined` if none
+   * was supplied (in which case `start()` is a logged no-op). See
+   * `LinkClientOptions.url`.
+   */
+  readonly url    : string | undefined;
+  /** The HMAC secret, or `undefined`. See `LinkClientOptions.secret`. */
+  readonly secret : string | undefined;
+  /** The peer kind, or `undefined`. See `LinkClientOptions.kind`. */
+  readonly kind   : string | undefined;
   readonly name   : string;
   peers           : PeerInfo[];
 
@@ -891,7 +934,17 @@ export class LinkClient extends EventEmitter {
    */
   health(): HealthSnapshot;
 
-  /** Latest peer list as broadcast by the hub. */
+  /**
+   * Latest peer list as broadcast by the hub. The returned array is a
+   * defensive deep copy and is safe to mutate.
+   *
+   * The list **includes the calling client itself**: the hub's
+   * `peers.update` is the full membership snapshot, so a v0.5 link with
+   * `kind: 'coordinator'` will see a `'coordinator'` entry alongside
+   * every other peer. Filter it out client-side
+   * (`getPeers().filter((p) => p.kind !== link.kind)`) if you only want
+   * "everyone else".
+   */
   getPeers(): PeerInfo[];
 
   /** Latest known status for a peer of the given kind, or null. */
@@ -941,15 +994,6 @@ export class LinkClient extends EventEmitter {
   emit(          event: string | symbol,  ...args: any[])                    : boolean;
 }
 
-/** @deprecated Use `LinkClient`. The `LinkBusClient` name is kept as an alias in v0.4.x and will be removed in v0.5.0. */
-export const LinkBusClient: typeof LinkClient;
-
-/** @deprecated Use `LinkClientOptions`. */
-export type LinkBusClientOptions = LinkClientOptions;
-
-/** @deprecated Use `LinkClientEvents`. */
-export type LinkBusClientEvents = LinkClientEvents;
-
 /**
  * The hub's `secret` option accepts three shapes:
  *
@@ -967,6 +1011,13 @@ export type LinkBusClientEvents = LinkClientEvents;
  * In per-peer modes, the hub becomes a re-signing relay: incoming messages
  * are verified with the sender's key, outgoing forwards are re-signed with
  * each recipient's key.
+ *
+ * Call frequency: the resolver runs once per inbound `hello` attempt,
+ * including unauthenticated and spoofed ones - the hub must look up the
+ * key before it can verify the hello signature. Implementations should
+ * cache lookups aggressively (including negative results, with a short
+ * TTL) and avoid expensive cache-miss paths; see `SECURITY.md` for the
+ * threat-model context.
  */
 export type HubSecretResolver =
   | string
@@ -1026,6 +1077,16 @@ export interface CreateHubOptions {
    * socket and never speaks). Set to 0 to disable. Default: 10000.
    */
   helloTimeoutMs?: number;
+
+  /**
+   * Cap on the number of concurrent un-authenticated (pre-hello) sockets.
+   * When exceeded, the oldest pending socket is force-closed (FIFO
+   * eviction) and emits `peer.timeout` with `reason: 'pending-cap'`.
+   * Defends against attackers opening many TCP connections and never
+   * speaking, which would otherwise pin one hello-timeout timer per
+   * socket until `helloTimeoutMs` elapsed. Default: 1024. Since v0.5.
+   */
+  maxPendingSockets?: number;
 
   /**
    * HMAC hash algorithm for sign/verify. Must match the clients.
@@ -1197,7 +1258,14 @@ export interface CreateHubServerOptions extends CreateHubOptions {
    */
   enableHealthRoute?: boolean;
 
-  /** Adds GET /state → `getState()` + extraState(). Default: true. Ignored when `server` is provided. */
+  /**
+   * Adds GET /state → `getState()` + extraState(). **Default: `false`** as
+   * of v0.5.0** (previously `true`); /state exposes peer kinds, hello
+   * payloads, and last-known statuses, which is fine for an internal
+   * dashboard but undesirable on a public bind. Opt in explicitly when
+   * you want it. If you opt in *and* bind to `0.0.0.0`, the hub also logs
+   * a warning at startup. Ignored when `server` is provided.
+   */
   enableStateRoute?: boolean;
 
   /**
@@ -1244,7 +1312,498 @@ export interface HubServer {
   health()                 : HubHealthSnapshot;
   readonly isStarted       : boolean;
   readonly isStopping      : boolean;
+  /** True after `stop()` has fully torn the server down. `createHubServer` is single-shot; once this latches `true`, `start()` will throw. */
+  readonly isStopped       : boolean;
   readonly isOwnHttpServer : boolean;
 }
 
 export function createHubServer(options: CreateHubServerOptions): HubServer;
+
+export type LogLevel = 0 | 1 | 2 | 3;
+
+export interface LogLevels {
+  readonly DEBUG: 0;
+  readonly INFO:  1;
+  readonly WARN:  2;
+  readonly ERROR: 3;
+}
+
+export const LEVELS: LogLevels;
+
+export type LogLevelName = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
+                        | 'debug' | 'info' | 'warn' | 'error';
+
+export type LogFn = (context: string, message?: unknown, ...args: unknown[]) => void;
+
+export type ErrorSink = (
+  context: string,
+  message: unknown,
+  error: Error,
+) => void | Promise<void>;
+
+/**
+ * The rich logger object returned by `createLogger`. Extends `Logger`
+ * (the two-method `{ log, warn }` shim that `LinkClient` / `createHub`
+ * / `createHubServer` accept as their `logger` option) so a
+ * `LeveledLogger` can be passed straight in - no adapter needed:
+ *
+ *   const log  = createLogger();
+ *   const link = new LinkClient({ ..., logger: log });
+ *
+ * `log` is the `l` (INFO) function; `warn` is `lW` (WARN). The
+ * adapter form `{ log: leveled.l, warn: leveled.lW }` still works for
+ * back-compat, but it's no longer required.
+ *
+ * `warn` is mapped to `lW` (not `lE`) on purpose - `LinkClient` uses
+ * `logger.warn` for routine drops (backpressure, replayed messages,
+ * signature mismatches, transient ws errors) and routing those into
+ * an error sink would flood it on every misconfigured-secret
+ * reconnect.
+ */
+export interface LeveledLogger extends Logger {
+  readonly LEVELS: LogLevels;
+  l:  LogFn;
+  lD: LogFn;
+  lW: LogFn;
+  lE: LogFn;
+  /** Alias of `l` (INFO) - satisfies the {@link Logger} interface. */
+  log:  LogFn;
+  /** Alias of `lW` (WARN) - satisfies the {@link Logger} interface. */
+  warn: LogFn;
+  setMinLevel(value: LogLevel | LogLevelName): void;
+  setErrorSink(fn: ErrorSink | null): void;
+  clearErrorSink(): void;
+}
+
+export interface CreateLoggerOptions {
+  /** number (LEVELS.*) or string ('DEBUG'|'INFO'|'WARN'|'ERROR'). Default: NODE_ENV='production' → INFO else DEBUG. */
+  minLevel?: LogLevel | LogLevelName;
+  /** Mirror Error instances to a sink (e.g. webhook, Sentry). */
+  errorSink?: ErrorSink;
+  /** Override the timestamp prefix. Default: ISO 'HH:MM:SS.mmm'. */
+  timestamp?: () => string;
+}
+
+export function createLogger(opts?: CreateLoggerOptions): LeveledLogger;
+
+export function num(v: unknown): number | undefined;
+export function bool(v: unknown): boolean | undefined;
+
+export function requireEnv<K extends string>(
+  keys: readonly K[],
+  env?: NodeJS.ProcessEnv,
+): Record<K, string>;
+
+/**
+ * The subset of `LinkClientOptions` that `linkClientOptionsFromEnv` knows
+ * how to read from the environment. Deliberately a subset, not exhaustive:
+ * the per-call timing knobs (`defaultRpcTimeoutMs`, `statusIntervalMs`,
+ * `helloAckDiagnosticMs`) and the reconnect-timing knobs
+ * (`reconnectInitialMs`, `reconnectMaxMs`, `reconnectGrowth`) are usually
+ * pinned in code per service rather than per deployment, so they're not
+ * env-mapped here. If you need them from env, layer your own
+ * `num(process.env.X)` onto the returned object.
+ */
+export interface LinkClientEnvOptions {
+  url?: string;
+  secret?: string;
+  kind?: string;
+  hashAlgo?: string;
+  perMessageDeflate?: boolean;
+  reconnectOnRejection?: boolean;
+  reconnectJitter?: number;
+  replayWindowMs?: number;
+  maxRecentIds?: number;
+  maxMessageBytes?: number;
+  maxBufferedBytes?: number;
+}
+
+export interface LinkClientOptionsFromEnvOpts {
+  /** Read FOO_URL/FOO_KIND/etc instead of LINK_*. Default: 'LINK_'. */
+  envPrefix?: string;
+}
+
+export function linkClientOptionsFromEnv(
+  env?: NodeJS.ProcessEnv,
+  opts?: LinkClientOptionsFromEnvOpts,
+): LinkClientEnvOptions;
+
+export const DEFAULT_CLIENT_CONCERNING_REASONS: readonly string[];
+export const DEFAULT_HUB_CONCERNING_REASONS:    readonly string[];
+
+export interface AttachObservabilityOptions {
+  logger: LeveledLogger;
+  /** Log context prefix. Defaults to 'link' (client) or 'hub' (hub). */
+  context?: string;
+  /** Promote per-RPC traces (and verbose hub events) to info. */
+  verbose?: boolean;
+  /** Override the default reason set entirely. */
+  concerningReasons?: readonly string[];
+  /** Add to the default reason set. */
+  extraConcerningReasons?: readonly string[];
+}
+
+export function attachClientObservability(
+  link: LinkClient,
+  opts: AttachObservabilityOptions,
+): void;
+
+export function attachHubObservability(
+  hub: EventEmitter,
+  opts: AttachObservabilityOptions,
+): void;
+
+export interface WaitForPeerOptions {
+  /**
+   * Reject with an `Error` after this many ms if no matching peer is
+   * seen. 0 means "no timeout" (matches `link.ready()` / `link.waitFor()` /
+   * `link.rpc()` semantics). Default 30_000.
+   */
+  timeoutMs?: number;
+  /** Default true - only return when the peer is currently connected. */
+  requireConnected?: boolean;
+  /**
+   * Optional `AbortSignal`. Aborting rejects the helper with an error
+   * whose `name` is `'AbortError'`. An already-aborted signal rejects
+   * synchronously. Since v0.5.0 - earlier versions silently ignored this
+   * option.
+   */
+  signal?: AbortSignal;
+}
+
+export function waitForPeer(
+  link: LinkClient,
+  kind: string,
+  opts?: WaitForPeerOptions,
+): Promise<PeerInfo>;
+
+export interface RpcWithRetryOptions {
+  tries?: number;
+  timeoutMs?: number;
+  /** Backoff = baseDelayMs * attempt + jitter. Default 250. */
+  baseDelayMs?: number;
+  signal?: AbortSignal;
+}
+
+export function rpcWithRetry<T = unknown>(
+  link: LinkClient,
+  to: string,
+  type: string,
+  data: unknown,
+  opts?: RpcWithRetryOptions,
+): Promise<T>;
+
+export interface CreateSafePublisherOptions {
+  logger: Pick<LeveledLogger, 'lD' | 'lW'>;
+  context?: string;
+  /** Pre-check `link.hubFeatures.includes('topics')`. Default false. */
+  featureCheck?: boolean;
+}
+
+export function createSafePublisher(
+  link: LinkClient,
+  opts: CreateSafePublisherOptions,
+): (topic: string, payload: unknown) => boolean;
+
+export interface CreateSafeSendOptions {
+  logger: Pick<LeveledLogger, 'lD' | 'lW'>;
+  context?: string;
+  /** Pre-check `link.hubFeatures.includes('direct')`. Default false. */
+  featureCheck?: boolean;
+}
+
+export function createSafeSend(
+  link: LinkClient,
+  opts: CreateSafeSendOptions,
+): (to: string, type: string, data: unknown) => boolean;
+
+export type ShutdownFn = (signal?: string) => Promise<void> | void;
+export type ShutdownStep = (signal?: string) => unknown;
+
+export interface InstallProcessHandlersOptions {
+  shutdown: ShutdownFn;
+  logger: LeveledLogger;
+  context?: string;
+  signals?: readonly NodeJS.Signals[];
+  /** Default true. When false, uncaughtException is logged but not exited. */
+  exitOnUncaught?: boolean;
+}
+
+export function installProcessHandlers(
+  opts: InstallProcessHandlersOptions,
+): () => void;
+
+export interface CreateGracefulShutdownOptions {
+  logger: LeveledLogger;
+  context?: string;
+  /** Default 30_000. Use 0 to disable the watchdog. */
+  timeoutMs?: number;
+  /** Default 0. */
+  exitCode?: number;
+  /** Steps run in order; throws are logged but don't stop the chain. */
+  steps?: readonly ShutdownStep[];
+  /** Default true. Set false to skip process.exit (useful in tests). */
+  exitProcess?: boolean;
+}
+
+export function createGracefulShutdown(
+  opts: CreateGracefulShutdownOptions,
+): ShutdownFn;
+
+export interface SecretChangeEvent {
+  name: string;
+  path: string;
+  action: 'set' | 'del';
+  oldValue: string | null | undefined;
+  newValue: string | null;
+}
+
+export interface LoadSecretsOptions {
+  /** Cumulative budget for ready + peer wait + every get. Default 30_000. */
+  timeoutMs?: number;
+  /** Vault peer kind. Default 'link_secs'. */
+  secretsKind?: string;
+  /** Subscribe to secs.changed.<ns> and refetch on rotation. v0.4+ hub. */
+  watch?: boolean;
+  /** Called on every observed change once watch is on. */
+  onChange?: (ev: SecretChangeEvent) => void;
+  /**
+   * Optional `LeveledLogger`. Only `lW` is read - used for transient
+   * watch-reload failures (vault refused / timed out / disconnected
+   * mid-rotation; or the helper rejected a rotation event from a peer
+   * other than the configured vault). Falls back to a `console.warn`
+   * wrapper if absent. Since v0.5.
+   */
+  logger?: Pick<LeveledLogger, 'lW'>;
+}
+
+/**
+ * Well-known Symbol that may be present as a non-enumerable property on
+ * the object returned by `loadSecrets(..., { watch: true })`. Calling
+ * the value at this key tears down the rotation-event subscriptions
+ * the helper installed. Idempotent; only removes the helper's own
+ * subscriptions (caller-installed handlers on the same topic are
+ * untouched). Absent (and the lookup is `undefined`) for non-watch
+ * loads.
+ *
+ *   const { loadSecrets, LOADED_SECRETS_UNWATCH } = require('@presenc3/link-core');
+ *   const cfg = await loadSecrets(link, mapping, { watch: true });
+ *   // ...
+ *   cfg[LOADED_SECRETS_UNWATCH]?.();
+ *
+ * Symbol-keyed (rather than e.g. a `.close` method) so the cleanup
+ * handle cannot collide with a secret whose env name happens to be
+ * `close`. Since v0.5.
+ */
+export const LOADED_SECRETS_UNWATCH: unique symbol;
+
+/**
+ * Return shape of `loadSecrets`. Always carries the requested env-name
+ * keys as strings; additionally carries the symbol-keyed unwatch handle
+ * iff `opts.watch === true`. The symbol property is non-enumerable, so
+ * `JSON.stringify(cfg)` / `Object.keys(cfg)` only see the secret values.
+ */
+export type LoadedSecrets = Record<string, string> & {
+  [LOADED_SECRETS_UNWATCH]?: () => void;
+};
+
+export function loadSecrets(
+  link: LinkClient,
+  mapping: Record<string, string>,
+  opts?: LoadSecretsOptions,
+): Promise<LoadedSecrets>;
+
+/**
+ * A single recorded event in the ring buffer. The `kind` taxonomy
+ * mirrors what the hub emits, normalized for dashboard display:
+ *
+ *   'hub-up'         the LinkClient just became `ready`
+ *   'hub-down'       the LinkClient disconnected
+ *   'rejected'       the hub rejected our hello (`hello.ack ok:false`)
+ *   'protocol-error' the LinkClient dropped an incoming message
+ *   'backpressure'   the LinkClient dropped an outgoing message
+ *   'join'           a peer connected to the hub
+ *   'leave'          a peer disconnected from the hub
+ *   'replace'        a same-kind peer reconnected with a fresh socket
+ *   'status'         a peer published a status update
+ *   'rpc-fail'       an outbound `rpc()` call failed
+ *   'direct'         an inbound directed message
+ *
+ * The `t` field is always present and is `Date.now()` at record time.
+ */
+export interface RecordedEvent {
+  kind:
+    | 'hub-up'
+    | 'hub-down'
+    | 'rejected'
+    | 'protocol-error'
+    | 'backpressure'
+    | 'join'
+    | 'leave'
+    | 'replace'
+    | 'status'
+    | 'rpc-fail'
+    | 'direct';
+  /**
+   * Origin of the event:
+   *   'link_server'   originated from the hub side of the wire
+   *   'self'          originated from this LinkClient
+   *   <peer-kind>     originated from the named peer
+   */
+  from: string | null | undefined;
+  t: number;
+  /** Other fields vary by `kind` - see the implementation for the schema per kind. */
+  [extra: string]: unknown;
+}
+
+/**
+ * Self-identity projection in the snapshot. Mirrors what the LinkClient
+ * was constructed with (`kind` / `name`) plus the hub's advertised
+ * `features` once `'ready'` has fired.
+ */
+export interface RecorderSelf {
+  kind:     string;
+  name:     string | null;
+  /** Null until `link.hubFeatures` is populated (first verified message). */
+  features: string[] | null;
+}
+
+/**
+ * The shape `getSnapshot()` and the `'snapshot'` event deliver. Designed
+ * to be JSON-stringified and shipped over an SSE stream (or any other
+ * dashboard transport) as-is. Every field is a fresh value per call.
+ */
+export interface RecorderSnapshot {
+  /** Mirror of `link.isConnected()` at snapshot time. */
+  connected: boolean;
+  /** Mirror of `link.isReady()` at snapshot time. */
+  ready:     boolean;
+  /**
+   * Identity projection. `null` if the LinkClient has no `kind` set
+   * (shouldn't happen for a started client, but the recorder doesn't
+   * assume).
+   */
+  self:      RecorderSelf | null;
+  /** Latest peer list from `link.getPeers()`. */
+  peers:     readonly PeerInfo[];
+  /** `kind` -> last-known status for every peer the LinkClient has tracked. */
+  statuses:  Record<string, PeerStatus>;
+  /** Stamp passed to `createEventRecorder` (or `Date.now()` at construction). */
+  startedAt: number;
+  /** `link.health()` snapshot, or `null` if it threw / is unavailable. */
+  health:    HealthSnapshot | null;
+  /** Copy of the ring buffer at snapshot time. */
+  eventLog:  RecordedEvent[];
+  /** `Date.now()` at snapshot build time. */
+  at:        number;
+  /**
+   * Trigger that produced the snapshot. Present on auto-emitted snapshots
+   * (`'tick'`, `'ready'`, `'rejected'`, `'disconnect'`, `'peer.connect'`,
+   * `'peer.disconnect'`, `'peer.status'`, `'initial'`) and absent when
+   * `getSnapshot()` is called directly by user code.
+   */
+  _reason?:  string;
+}
+
+export interface CreateEventRecorderOptions {
+  /** Max recorded events; oldest evicted on overflow. Default 30. */
+  ringSize?: number;
+  /** Periodic snapshot-emit cadence in ms. 0 disables the heartbeat. Default 1000. */
+  heartbeatIntervalMs?: number;
+  /** Stamp included in `snapshot.startedAt`. Default `Date.now()` at construction. */
+  startedAt?: number;
+}
+
+/**
+ * Function returned by `onSnapshot()` / `onEvent()`. Calling it removes
+ * the subscriber. Idempotent.
+ */
+export type RecorderUnsubscribe = () => void;
+
+/**
+ * The object returned by `createEventRecorder`. Extends `EventEmitter` so
+ * `recorder.on('snapshot', ...)` / `recorder.on('event', ...)` work
+ * alongside the imperative `onSnapshot` / `onEvent` subscriber helpers.
+ *
+ * The recorder never emits `'error'` - subscriber throws are caught and
+ * surfaced via `process.emitWarning` so the host process keeps running.
+ */
+export interface EventRecorder extends EventEmitter {
+  /** Effective ring size after option clamping. */
+  readonly ringSize: number;
+  /** Effective heartbeat interval after option clamping; 0 means disabled. */
+  readonly heartbeatIntervalMs: number;
+  /** Effective `startedAt` stamp - shows up in every snapshot. */
+  readonly startedAt: number;
+
+  /** Build a fresh snapshot from the current LinkClient state + ring buffer. */
+  getSnapshot(): RecorderSnapshot;
+
+  /** Copy of the ring buffer at call time. */
+  getRecent(): RecordedEvent[];
+
+  /**
+   * Subscribe to snapshots. The subscriber is called synchronously with
+   * the current snapshot first (so a fresh SSE connection doesn't wait
+   * up to one heartbeat for its first frame), then on every subsequent
+   * emit. Subscriber throws are caught.
+   */
+  onSnapshot(fn: (snap: RecorderSnapshot) => void): RecorderUnsubscribe;
+
+  /**
+   * Subscribe to recorded events. Called on each newly-recorded event.
+   * Does NOT replay the ring buffer - call `getRecent()` first if history
+   * is needed. Subscriber throws are caught.
+   */
+  onEvent(fn: (evt: RecordedEvent) => void): RecorderUnsubscribe;
+
+  /**
+   * Detach all LinkClient listeners, clear the heartbeat, and drop all
+   * subscribers. Idempotent. After `close()`, the recorder no longer
+   * emits and accessors return the snapshot-at-close-time state.
+   */
+  close(): void;
+}
+
+/**
+ * Build an `EventRecorder` bound to a LinkClient. The recorder attaches
+ * listeners to a fixed set of LinkClient events (see
+ * `RECORDED_CLIENT_EVENTS`) and pushes each into a bounded ring buffer
+ * with a normalized `RecordedEvent` shape. A subset of those events
+ * (`SNAPSHOT_TRIGGERS`) also fire a snapshot emit; on top of that, an
+ * optional heartbeat emits a snapshot at a fixed cadence so idle
+ * dashboards stay live.
+ */
+export function createEventRecorder(
+  link: LinkClient,
+  opts?: CreateEventRecorderOptions,
+): EventRecorder;
+
+/**
+ * Client events the recorder listens to. Stable - changing this is a
+ * breaking change to the snapshot wire format.
+ */
+export const RECORDED_CLIENT_EVENTS: readonly (
+  | 'ready'
+  | 'rejected'
+  | 'disconnect'
+  | 'protocol-error'
+  | 'backpressure'
+  | 'peer.connect'
+  | 'peer.disconnect'
+  | 'peer.replaced'
+  | 'peer.status'
+  | 'rpc.complete'
+  | 'direct'
+)[];
+
+/** Subset of `RECORDED_CLIENT_EVENTS` whose arrival also fires a snapshot emit. */
+export const SNAPSHOT_TRIGGERS: readonly (
+  | 'ready'
+  | 'rejected'
+  | 'disconnect'
+  | 'peer.connect'
+  | 'peer.disconnect'
+  | 'peer.replaced'
+  | 'peer.status'
+)[];

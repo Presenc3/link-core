@@ -1,6 +1,6 @@
 'use strict';
 
-const { sanitizeHello }    = require('./hello.js');
+const { sanitizeHello, RESERVED_KINDS } = require('./hello.js');
 const { TAG, WS_OPEN, HUB_FEATURES } = require('./constants.js');
 const { verify, PROTOCOL_VERSION, isValidTopic } = require('../protocol.js');
 
@@ -8,7 +8,7 @@ function createMessageHandler(ctx, ws) {
   const {
     log,            hashAlgo,     replayWindowMs, maxMessageBytes,
     clients,        statuses,     subscriptions,  recentIds,
-    resolveSecret,  send,         broadcast,      publishPeers,
+    resolveSecret,  send,         publishPeers,
     untrackPending, emitSafe,     handleServerRpc,
   } = ctx;
 
@@ -55,10 +55,12 @@ function createMessageHandler(ctx, ws) {
 
       if (!claimedKind) {
         const rawKind = String(msg.data?.kind ?? '');
+        const trimmed = rawKind.trim();
         const detail =
-          rawKind.length === 0       ? 'missing-kind' :
-          rawKind.length > 256       ? 'oversized-kind' :
-                                       'invalid-kind';
+          trimmed.length === 0           ? 'missing-kind'  :
+          trimmed.length > 256           ? 'oversized-kind':
+          RESERVED_KINDS.has(trimmed)    ? 'reserved-kind' :
+                                           'invalid-kind';
 
         log.warn(TAG, `dropped hello: ${detail} (raw=${JSON.stringify(rawKind.slice(0, 64))})`);
         emitSafe('protocol-error', { reason: 'bad-hello', kind: null, detail });
@@ -71,12 +73,6 @@ function createMessageHandler(ctx, ws) {
       if (!verifyKey) {
         log.warn(TAG, `dropped hello: no key for kind=${claimedKind}`);
         emitSafe('protocol-error', { reason: 'unknown-kind', kind: claimedKind });
-        return;
-      }
-
-      if (ws.__secret) {
-        log.warn(TAG, `dropped hello: socket already authenticated as ${ws.__kind}`);
-        emitSafe('protocol-error', { reason: 'duplicate-hello', kind: ws.__kind });
         return;
       }
     } else {
@@ -125,8 +121,8 @@ function createMessageHandler(ctx, ws) {
     }
 
     if (recentIds && msg.type !== 'rpc.response') {
-      const senderKind = ws.__kind || (msg.type === 'hello' ? helloData?.kind : null);
-      const cacheKey = senderKind ? `${senderKind}|${msg.id}` : msg.id;
+      const senderKind = ws.__kind || helloData.kind;
+      const cacheKey   = `${senderKind}|${msg.id}`;
 
       if (recentIds.has(cacheKey)) {
         log.warn(TAG, `dropped: replay of id ${String(msg.id).slice(0, 8)} (type=${msg?.type})`);
@@ -148,6 +144,12 @@ function createMessageHandler(ctx, ws) {
     const type = msg.type;
 
     if (type === 'hello') {
+      if (!helloData) {
+        log.warn(TAG, `dropped hello: socket already authenticated as ${ws.__kind}`);
+        emitSafe('protocol-error', { reason: 'duplicate-hello', kind: ws.__kind });
+        return;
+      }
+
       const kind = helloData.kind;
 
       const existing = clients.get(kind);
@@ -183,7 +185,7 @@ function createMessageHandler(ctx, ws) {
 
       publishPeers();
 
-      const statusSnap = {};
+      const statusSnap = Object.create(null);
       for (const [k, s] of statuses.entries()) statusSnap[k] = s;
       send(ws, { type: 'status.snapshot', to: kind, data: statusSnap });
       return;
@@ -195,7 +197,10 @@ function createMessageHandler(ctx, ws) {
     if (type === 'status.update') {
       const at = Date.now();
       statuses.set(from, { status: msg.data, at });
-      broadcast('status.update', { from, status: msg.data, at });
+      for (const [kind, c] of clients.entries()) {
+        if (kind === from) continue;
+        send(c.ws, { type: 'status.update', to: kind, data: { from, status: msg.data, at } });
+      }
       return;
     }
 
@@ -337,19 +342,25 @@ function createMessageHandler(ctx, ws) {
     if (type === 'topic.message') {
       const topic   = msg.data?.topic;
       const payload = msg.data?.payload;
+
       if (!isValidTopic(topic)) {
         log.warn(TAG, `dropped: invalid topic on publish (kind=${from})`);
         emitSafe('protocol-error', { reason: 'invalid-topic', kind: from, type });
         return;
       }
+
       const subs = subscriptions.get(topic);
+
       if (!subs || subs.size === 0) {
-        emitSafe('topic.publish', { from, topic, payload, subscriberCount: 0 });
+        emitSafe('topic.publish', { from, topic, payload, subscriberCount: 0, delivered: 0 });
         return;
       }
+
       let delivered = 0;
+
       for (const sub of subs) {
         if (sub === from) continue;
+
         const target = clients.get(sub);
         if (!target?.ws || target.ws.readyState !== WS_OPEN) continue;
 
@@ -358,13 +369,16 @@ function createMessageHandler(ctx, ws) {
           from, to: sub,
           data: { topic, payload },
         });
+
         if (ok) delivered += 1;
       }
+
       emitSafe('topic.publish', {
         from, topic, payload,
         subscriberCount: subs.size,
         delivered,
       });
+
       return;
     }
 
@@ -372,8 +386,10 @@ function createMessageHandler(ctx, ws) {
       const to        = msg.to ? String(msg.to) : null;
       const directTy  = msg.data?.directType;
       if (!to || typeof directTy !== 'string' || !directTy) return;
+
       const target = clients.get(to);
       if (!target?.ws || target.ws.readyState !== WS_OPEN) return;
+
       const ok = send(target.ws, {
         type: 'direct',
         from, to,
@@ -382,6 +398,7 @@ function createMessageHandler(ctx, ws) {
           directData: msg.data?.directData,
         },
       });
+      
       if (ok) emitSafe('direct', { from, to, type: directTy, data: msg.data?.directData });
       return;
     }

@@ -69,14 +69,7 @@ class LinkNotReadyError extends LinkError {
   }
 }
 
-class FeatureUnsupportedError extends LinkError {
-  constructor(message, opts = {}) {
-    super(message, { ...opts, code: 'FEATURE_UNSUPPORTED' });
-    this.name = 'FeatureUnsupportedError';
-    if (opts.feature != null) this.feature = opts.feature;
-    if (opts.op      != null) this.op      = opts.op;
-  }
-}
+
 
 class ProtocolError extends LinkError {
   constructor(message, opts = {}) {
@@ -91,6 +84,15 @@ class HelloRejectedError extends LinkError {
     super(message, { ...opts, code: 'HELLO_REJECTED' });
     this.name = 'HelloRejectedError';
     if (opts.reason != null) this.reason = opts.reason;
+  }
+}
+
+class FeatureUnsupportedError extends LinkError {
+  constructor(message, opts = {}) {
+    super(message, { ...opts, code: 'FEATURE_UNSUPPORTED' });
+    this.name = 'FeatureUnsupportedError';
+    if (opts.feature != null) this.feature = opts.feature;
+    if (opts.op      != null) this.op      = opts.op;
   }
 }
 

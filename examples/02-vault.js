@@ -2,13 +2,17 @@
 
 /*
  * 02-vault.js
-  * A "secrets vault" peer. Other services ask it for credentials over RPC.
-  * In a real deployment, replace the in-memory STORE with a call to
-  * HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, 1Password
-  * Connect, etc. The link-core surface stays exactly the same.
-  * 
-  * Run from the repo root: node examples/02-vault.js
-**/
+ *
+ * A "secrets vault" peer. Other services ask it for credentials over
+ * RPC. In a real deployment, replace the in-memory STORE with a call
+ * to HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager,
+ * 1Password Connect, etc. The link-core surface stays exactly the
+ * same.
+ *
+ * For the loadSecrets() helper's wire convention, see 07-loadsecrets-vault.js.
+ *
+ * Run from the repo root: node examples/02-vault.js
+ */
 
 const { LinkClient } = require('../src/index.js');
 
@@ -21,7 +25,16 @@ const STORE = {
   'flag:experimental' :   'true',
 };
 
-// Trivial authorization policy: every kind we know about may read every secret. A real vault would consult an ACL based on `from`
+/*
+ * Trivial authorization policy: every kind we recognize is allowed to
+ * read every secret. A real vault would consult an ACL per (from, name).
+ *
+ * `msg.from` is the AUTHENTICATED kind - the hub stamps it from the
+ * sender socket's verified identity (never from the envelope `from`
+ * field a client might supply). It's safe to use directly for authz
+ * decisions. See: src/hub/dispatch.js + Security & threat model in
+ * the README.
+ */
 const ALLOW = new Set(['worker', 'coordinator']);
 
 const link = new LinkClient({
@@ -34,7 +47,7 @@ const link = new LinkClient({
     // secrets.get({ name }) → { name, value }
     'secrets.get': async ({ name } = {}, msg) => {
 
-      // The string is what shows up on the caller's RpcRemoteError.message.
+      // The string is what shows up on the caller's RpcRemoteError.message
       if (!ALLOW.has(msg.from)) throw new Error(
         `Forbidden: ${msg.from} cannot read secrets`
       );
@@ -56,7 +69,7 @@ const link = new LinkClient({
     // secrets.list() → { names: string[] }
     'secrets.list': async (_data, msg) => {
       if (!ALLOW.has(msg.from)) throw new Error(`Forbidden: ${msg.from}`);
-      
+
       console.log(`${fn} secrets.list → ${msg.from}`);
       return { names: Object.keys(STORE) };
     },

@@ -2,7 +2,7 @@
 
 const { TAG } = require('./constants.js');
 const { verify, PROTOCOL_VERSION } = require('../protocol.js');
-const { RpcRemoteError, RpcDisconnectError } = require('../util/errors.js');
+const { RpcRemoteError, RpcDisconnectError } = require('../internal/errors.js');
 
 function handleInboundMessage(client, raw) {
   if (raw.length > client.maxMessageBytes) {
@@ -119,15 +119,29 @@ function handleInboundMessage(client, raw) {
   switch (msg.type) {
     case 'peers.update': {
       const newPeers = msg.data?.peers || [];
-      const oldKinds = new Set(client.peers.map(p => p.kind));
-      const newKinds = new Set(newPeers.map(p => p.kind));
-      for (const p of newPeers) {
-        if (!oldKinds.has(p.kind)) client.emit('peer.connect', p);
+
+      const oldByKind = new Map(client.peers.map((p) => [p.kind, p]));
+      const newByKind = new Map(newPeers.map((p) => [p.kind, p]));
+
+      const events = [];
+
+      for (const np of newPeers) {
+        const op = oldByKind.get(np.kind);
+        if (!op) {
+          events.push(['peer.connect', np]);
+        } else if (op.connectedAt !== np.connectedAt) {
+          events.push(['peer.replaced', { kind: np.kind, prevPeer: op, peer: np }]);
+        }
       }
-      for (const p of client.peers) {
-        if (!newKinds.has(p.kind)) client.emit('peer.disconnect', p);
+      for (const op of client.peers) {
+        if (!newByKind.has(op.kind)) {
+          events.push(['peer.disconnect', op]);
+        }
       }
+
       client.peers = newPeers;
+
+      for (const [evt, payload] of events) client.emit(evt, payload);
       return;
     }
 

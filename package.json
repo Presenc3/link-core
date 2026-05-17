@@ -1,7 +1,7 @@
 {
   "name": "@presenc3/link-core",
-  "version": "0.4.1",
-  "description": "Shared WebSocket link protocol, client, and hub for inter-service communication",
+  "version": "0.5.0",
+  "description": "Shared WebSocket link protocol, client, and hub for inter-service communication. Also bundles companion helpers (logger, env coercion, observability, RPC patterns, lifecycle, secrets loader)",
   "main":   "./src/index.js",
   "module": "./src/index.mjs",
   "types":  "./src/index.d.ts",
@@ -12,6 +12,12 @@
       "require": "./src/index.js",
       "default": "./src/index.js"
     },
+    "./helpers": {
+      "types":   "./src/helpers/index.d.ts",
+      "import":  "./src/helpers/index.mjs",
+      "require": "./src/helpers/index.js",
+      "default": "./src/helpers/index.js"
+    },
     "./package.json": "./package.json"
   },
   "sideEffects": false,
@@ -20,10 +26,10 @@
   },
   "files": [
     "src",
-    "CHANGELOG.MD",
+    "CHANGELOG.md",
     "LICENSE",
-    "README.MD",
-    "SECURITY.MD"
+    "README.md",
+    "SECURITY.md"
   ],
   "keywords": [
     "websocket",
@@ -58,9 +64,14 @@
     }
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test":            "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
+    "test:unit":       "node --test \"test/unit/**/*.test.js\" \"test/helpers/**/*.test.js\"",
+    "test:integration":"node --test \"test/integration/**/*.test.js\"",
+    "test:exports":    "node --test \"test/exports/**/*.test.js\" \"test/exports/**/*.test.mjs\"",
+    "check:pack":      "npm pack --dry-run",
+    "prepublishOnly":  "npm test && npm run check:pack"
   }
 }
