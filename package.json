@@ -1,58 +1,56 @@
 {
-  "version"     : "0.6.0",
-  "name"        : "@presenc3/link-core",
-  "description" : "Shared WebSocket link protocol, client, and hub for inter-service communication. Companion helpers now live in @presenc3/link-helpers.",
-  
-  "main"   : "./src/index.js",
-  "module" : "./src/index.mjs",
-  "types"  : "./src/index.d.ts",
-
-  "exports" : {
-    "." : {
-      "default" : "./src/index.js",
-      "require" : "./src/index.js",
-      "import"  : "./src/index.mjs",
-      "types"   : "./src/index.d.ts"
+  "version": "0.6.0",
+  "name": "@presenc3/link-core",
+  "description": "Shared WebSocket link protocol, client, and hub for inter-service communication. Companion helpers now live in @presenc3/link-helpers.",
+  "main": "./src/index.js",
+  "module": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs",
+      "require": "./src/index.js",
+      "default": "./src/index.js"
     },
-    "./primitives" : {
-      "default" : "./src/primitives.js",
-      "require" : "./src/primitives.js",
-      "import"  : "./src/primitives.mjs",
-      "types"   : "./src/primitives.d.ts"
+    "./primitives": {
+      "types": "./src/primitives.d.ts",
+      "import": "./src/primitives.mjs",
+      "require": "./src/primitives.js",
+      "default": "./src/primitives.js"
     },
-    "./protocol" : {
-      "default" : "./src/protocol.js",
-      "require" : "./src/protocol.js",
-      "import"  : "./src/protocol.mjs",
-      "types"   : "./src/protocol.d.ts"
+    "./protocol": {
+      "types": "./src/protocol.d.ts",
+      "import": "./src/protocol.mjs",
+      "require": "./src/protocol.js",
+      "default": "./src/protocol.js"
     },
-    "./errors" : {
-      "default" : "./src/errors.js",
-      "require" : "./src/errors.js",
-      "import"  : "./src/errors.mjs",
-      "types"   : "./src/errors.d.ts"
+    "./errors": {
+      "types": "./src/errors.d.ts",
+      "import": "./src/errors.mjs",
+      "require": "./src/errors.js",
+      "default": "./src/errors.js"
     },
-    "./client" : {
-      "default" : "./src/client/index.js",
-      "require" : "./src/client/index.js",
-      "import"  : "./src/client/index.mjs",
-      "types"   : "./src/client/index.d.ts"
+    "./client": {
+      "types": "./src/client/index.d.ts",
+      "import": "./src/client/index.mjs",
+      "require": "./src/client/index.js",
+      "default": "./src/client/index.js"
     },
-    "./hub" : {
-      "default" : "./src/hub/index.js",
-      "require" : "./src/hub/index.js",
-      "import"  : "./src/hub/index.mjs",
-      "types"   : "./src/hub/index.d.ts"
+    "./hub": {
+      "types": "./src/hub/index.d.ts",
+      "import": "./src/hub/index.mjs",
+      "require": "./src/hub/index.js",
+      "default": "./src/hub/index.js"
     },
     "./package.json": "./package.json"
   },
-
   "files": [
     "src",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "SECURITY.md",
+    "CHANGELOG.md"
   ],
-  
   "keywords": [
     "ws",
     "rpc",
@@ -64,34 +62,39 @@
     "service-bus",
     "microservices"
   ],
-
-  "license" : "MIT",
-  "author"  : "Presenc3",
-
-  "sideEffects"   : false,
-  "engines"       : { "node"   : ">=20"   },
-  "publishConfig" : { "access" : "public" },
-
-  "dependencies" : { "ws" : "^8.20.0" },
-
-  "devDependencies" : {
-    "@types/node" : "^25.9.1",
-    "@types/ws"   : "^8.18.1",
-    "typescript"  : "^6.0.3"
+  "license": "MIT",
+  "author": "Presenc3",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
   },
-
-  "homepage"   : "https://github.com/Presenc3/link-core#readme",
-  "bugs"       : { "url": "https://github.com/Presenc3/link-core/issues" },
-  "repository" : { "type" : "git", "url"  : "git+https://github.com/Presenc3/link-core.git" },
-
-  "scripts" : {
-    "test"             : "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
-    "test:unit"        : "node --test \"test/unit/**/*.test.js\"",
-    "test:integration" : "node --test \"test/integration/**/*.test.js\"",
-    "test:exports"     : "node --test \"test/exports/**/*.test.js\" \"test/exports/**/*.test.mjs\"",
-    "type-check"       : "tsc -p tsconfig.json",
-    "bench"            : "node bench/throughput.js",
-    "check:pack"       : "npm pack --dry-run",
-    "prepublishOnly"   : "npm run type-check && npm test && npm run check:pack"
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.3"
+  },
+  "homepage": "https://github.com/Presenc3/link-core#readme",
+  "bugs": {
+    "url": "https://github.com/Presenc3/link-core/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Presenc3/link-core.git"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
+    "test:unit": "node --test \"test/unit/**/*.test.js\"",
+    "test:integration": "node --test \"test/integration/**/*.test.js\"",
+    "test:exports": "node --test \"test/exports/**/*.test.js\" \"test/exports/**/*.test.mjs\"",
+    "type-check": "tsc -p tsconfig.json",
+    "bench": "node bench/throughput.js",
+    "check:pack": "npm pack --dry-run",
+    "prepublishOnly": "npm run type-check && npm test && npm run check:pack"
   }
 }

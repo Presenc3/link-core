@@ -110,7 +110,7 @@ function loadsWs(probe) {
   const code =
     probe +
     ';process.stdout.write(String(Object.keys(require.cache)' +
-    ".some(k => k.includes('/node_modules/ws/'))))";
+    ".some(k => k.replace(/\\\\/g, '/').includes('/node_modules/ws/'))))";
   return execFileSync(process.execPath, ['-e', code], { encoding: 'utf8' }) === 'true';
 }
 
