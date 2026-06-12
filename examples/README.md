@@ -1,6 +1,6 @@
 # `link-core` examples
 
-Two layers of examples. The **four-service deployment** (`01`–`04`) demonstrates the protocol's core primitives end-to-end. The **standalone showcases** (`05`–`09`) each isolate one v0.5 helper or pattern so you can grok it without the full topology around it.
+Two layers of examples. The **four-service deployment** (`01`–`04`) demonstrates the protocol's core primitives end-to-end. The **standalone showcases** (`05`–`07`) each isolate one pattern. Note: the helper-driven examples (`03`–`06`) now import the helpers from [`@presenc3/link-helpers`](https://www.npmjs.com/package/@presenc3/link-helpers) - install it alongside link-core to run them. The `loadSecrets` consumer (`08`) and graceful-shutdown (`09`) demos have moved to that package's own `examples/` folder.
 
 ## The four-service deployment
 
@@ -16,7 +16,7 @@ Two layers of examples. The **four-service deployment** (`01`–`04`) demonstrat
         │  vault  │   │  worker  │   │ coordinator │
         └─────────┘   └──────────┘   └─────────────┘
         secrets.get      job.run        rpc('worker', ...)
-        secrets.list     job.progress→  on('direct', ...)
+        secrets.list     job.progress>  on('direct', ...)
                          (status push)
 ```
 
@@ -38,8 +38,6 @@ Each is a single-file demo of one pattern. Run alongside the hub (`01`) and any 
 | `05-disabled-mode`               | `LinkClient` runs in "no link bus" local-dev mode when `LINK_URL` / `LINK_SECRET` / `LINK_KIND` are missing. `link.ready()` rejects synchronously with `LinkNotReadyError` (v0.5+) and the service continues standalone. `createSafePublisher` turns `link.publish()` into a no-op on a disabled link, so the application code path doesn't fork. |
 | `06-dashboard`                   | `createEventRecorder` for a live snapshot+event-log view of the bus, streamed over SSE. Also: `createLogger` passed directly as `logger` (no adapter), `attachClientObservability` for one-line listener wiring. Open `http://localhost:9000`. |
 | `07-loadsecrets-vault`           | A vault peer with the `loadSecrets()` wire convention: `kind: link_secs`, `secs.get` RPC, `sec/<ns>/<rest>` paths, `secs.changed.<ns>` topic for rotation announcements. Rotates `sec/shared/api-token` every 8s so you can watch hot-reload work. |
-| `08-loadsecrets-consumer`        | `loadSecrets({ watch: true, onChange })` for one-line config bootstrap with hot-reload. `cfg[LOADED_SECRETS_UNWATCH]?.()` for clean teardown. Pair with `07`. |
-| `09-graceful-shutdown`           | `createGracefulShutdown` (watchdog-bounded shutdown sequencer) + `installProcessHandlers` (SIGINT/SIGTERM/uncaughtException/unhandledRejection). Multi-step shutdown with a fake link, write buffer, and DB pool. Press Ctrl-C. |
 
 ## Running
 
@@ -86,17 +84,14 @@ LINK_URL= LINK_SECRET= LINK_KIND= node examples/05-disabled-mode.js
 node examples/06-dashboard.js
 # then open http://localhost:9000
 
-# 07+08: loadSecrets demo - needs the hub (01) running. The hub
-#        needs a key for kind: link_secs - add `link_secs:
-#        'dev-secs-key'` to 01-hub.js's KEYS map.
+# 07: loadSecrets vault - needs the hub (01) running. The hub needs a
+#     key for kind: link_secs - add `link_secs: 'dev-secs-key'` to
+#     01-hub.js's KEYS map. The matching consumer (08) and the
+#     graceful-shutdown demo (09) now live in @presenc3/link-helpers.
 node examples/07-loadsecrets-vault.js
-node examples/08-loadsecrets-consumer.js
-
-# 09: graceful-shutdown is self-contained. Press Ctrl-C.
-node examples/09-graceful-shutdown.js
 ```
 
-Stop any service with `Ctrl-C`. The hub does graceful shutdown (close WSS → close client sockets → terminate stragglers → close HTTP); the clients reject pending RPCs with `RpcDisconnectError` and exit.
+Stop any service with `Ctrl-C`. The hub does graceful shutdown (close WSS > close client sockets > terminate stragglers > close HTTP); the clients reject pending RPCs with `RpcDisconnectError` and exit.
 
 ## Configuration
 
@@ -136,6 +131,6 @@ Everything else is portable as-is.
 There are **two** vault patterns in here, side by side:
 
 - **`02-vault.js`** - the **low-level RPC primitive**. The worker calls `link.rpc('vault', 'secrets.get', { name })` directly. Simplest possible vault contract - exactly what you'd want if you're rolling your own.
-- **`07-loadsecrets-vault.js`** + **`08-loadsecrets-consumer.js`** - the **opinionated `loadSecrets()` helper**. Adds a naming convention (`kind: link_secs`, `secs.get`, `sec/<ns>/<rest>` paths) and a hot-reload topic (`secs.changed.<ns>`). The consumer is one `await loadSecrets(...)` call.
+- **`07-loadsecrets-vault.js`** (here) + **`08-loadsecrets-consumer.js`** (now in `@presenc3/link-helpers`) - the **opinionated `loadSecrets()` helper**. Adds a naming convention (`kind: link_secs`, `secs.get`, `sec/<ns>/<rest>` paths) and a hot-reload topic (`secs.changed.<ns>`). The consumer is one `await loadSecrets(...)` call.
 
 Either is fine for production. The helper is what `loadSecrets({ watch: true })` ships with by default since v0.5.0; the raw `02-vault.js` shape gives you full control over wire format if you have an existing convention to match.

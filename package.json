@@ -1,77 +1,97 @@
 {
-  "name": "@presenc3/link-core",
-  "version": "0.5.0",
-  "description": "Shared WebSocket link protocol, client, and hub for inter-service communication. Also bundles companion helpers (logger, env coercion, observability, RPC patterns, lifecycle, secrets loader)",
-  "main":   "./src/index.js",
-  "module": "./src/index.mjs",
-  "types":  "./src/index.d.ts",
-  "exports": {
-    ".": {
-      "types":   "./src/index.d.ts",
-      "import":  "./src/index.mjs",
-      "require": "./src/index.js",
-      "default": "./src/index.js"
+  "version"     : "0.6.0",
+  "name"        : "@presenc3/link-core",
+  "description" : "Shared WebSocket link protocol, client, and hub for inter-service communication. Companion helpers now live in @presenc3/link-helpers.",
+  
+  "main"   : "./src/index.js",
+  "module" : "./src/index.mjs",
+  "types"  : "./src/index.d.ts",
+
+  "exports" : {
+    "." : {
+      "default" : "./src/index.js",
+      "require" : "./src/index.js",
+      "import"  : "./src/index.mjs",
+      "types"   : "./src/index.d.ts"
     },
-    "./helpers": {
-      "types":   "./src/helpers/index.d.ts",
-      "import":  "./src/helpers/index.mjs",
-      "require": "./src/helpers/index.js",
-      "default": "./src/helpers/index.js"
+    "./primitives" : {
+      "default" : "./src/primitives.js",
+      "require" : "./src/primitives.js",
+      "import"  : "./src/primitives.mjs",
+      "types"   : "./src/primitives.d.ts"
+    },
+    "./protocol" : {
+      "default" : "./src/protocol.js",
+      "require" : "./src/protocol.js",
+      "import"  : "./src/protocol.mjs",
+      "types"   : "./src/protocol.d.ts"
+    },
+    "./errors" : {
+      "default" : "./src/errors.js",
+      "require" : "./src/errors.js",
+      "import"  : "./src/errors.mjs",
+      "types"   : "./src/errors.d.ts"
+    },
+    "./client" : {
+      "default" : "./src/client/index.js",
+      "require" : "./src/client/index.js",
+      "import"  : "./src/client/index.mjs",
+      "types"   : "./src/client/index.d.ts"
+    },
+    "./hub" : {
+      "default" : "./src/hub/index.js",
+      "require" : "./src/hub/index.js",
+      "import"  : "./src/hub/index.mjs",
+      "types"   : "./src/hub/index.d.ts"
     },
     "./package.json": "./package.json"
   },
-  "sideEffects": false,
-  "publishConfig": {
-    "access": "public"
-  },
+
   "files": [
     "src",
-    "CHANGELOG.md",
     "LICENSE",
-    "README.md",
-    "SECURITY.md"
+    "README.md"
   ],
+  
   "keywords": [
-    "websocket",
     "ws",
     "rpc",
-    "service-bus",
     "ipc",
-    "hmac",
     "hub",
-    "microservices",
-    "protocol"
+    "hmac",
+    "protocol",
+    "websocket",
+    "service-bus",
+    "microservices"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Presenc3/link-core.git"
+
+  "license" : "MIT",
+  "author"  : "Presenc3",
+
+  "sideEffects"   : false,
+  "engines"       : { "node"   : ">=20"   },
+  "publishConfig" : { "access" : "public" },
+
+  "dependencies" : { "ws" : "^8.20.0" },
+
+  "devDependencies" : {
+    "@types/node" : "^25.9.1",
+    "@types/ws"   : "^8.18.1",
+    "typescript"  : "^6.0.3"
   },
-  "author": "Presenc3",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/Presenc3/link-core/issues"
-  },
-  "homepage": "https://github.com/Presenc3/link-core#readme",
-  "dependencies": {
-    "ws": "^8.20.0"
-  },
-  "peerDependencies": {
-    "@types/ws": "^8.18.1"
-  },
-  "peerDependenciesMeta": {
-    "@types/ws": {
-      "optional": true
-    }
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "scripts": {
-    "test":            "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
-    "test:unit":       "node --test \"test/unit/**/*.test.js\" \"test/helpers/**/*.test.js\"",
-    "test:integration":"node --test \"test/integration/**/*.test.js\"",
-    "test:exports":    "node --test \"test/exports/**/*.test.js\" \"test/exports/**/*.test.mjs\"",
-    "check:pack":      "npm pack --dry-run",
-    "prepublishOnly":  "npm test && npm run check:pack"
+
+  "homepage"   : "https://github.com/Presenc3/link-core#readme",
+  "bugs"       : { "url": "https://github.com/Presenc3/link-core/issues" },
+  "repository" : { "type" : "git", "url"  : "git+https://github.com/Presenc3/link-core.git" },
+
+  "scripts" : {
+    "test"             : "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
+    "test:unit"        : "node --test \"test/unit/**/*.test.js\"",
+    "test:integration" : "node --test \"test/integration/**/*.test.js\"",
+    "test:exports"     : "node --test \"test/exports/**/*.test.js\" \"test/exports/**/*.test.mjs\"",
+    "type-check"       : "tsc -p tsconfig.json",
+    "bench"            : "node bench/throughput.js",
+    "check:pack"       : "npm pack --dry-run",
+    "prepublishOnly"   : "npm run type-check && npm test && npm run check:pack"
   }
 }

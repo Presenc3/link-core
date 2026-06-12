@@ -6,30 +6,47 @@ const WS_OPEN        = 1;
 const HELLO_KIND_MAX = 256;
 const HELLO_NAME_MAX = 256;
 
+/**
+ * WebSocket close code (application range 4000-4999) the hub uses when it
+ * closes an older socket because a newer connection authenticated as the
+ * same `kind`. The displaced client recognises this code and does NOT
+ * auto-reconnect (reconnecting would just restart a replacement war
+ * between two processes sharing a kind). Shared with the client; keep the
+ * two in sync.
+ */
+const WS_CLOSE_REPLACED = 4000;
+
 const KIND_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
+const DEFAULT_DRAIN_RETRY_MS        = 25;
 const DEFAULT_MAX_PENDING_SOCKETS   = 1024;
+const DEFAULT_MAX_CONCURRENT_RPC    = 256;
 const DEFAULT_MAX_RECENT_IDS        = 10_000;
 const DEFAULT_HELLO_TIMEOUT_MS      = 10_000;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
 const DEFAULT_MAX_MESSAGE_BYTES     = 1_048_576;
-const DEFAULT_REPLAY_WINDOW_MS      = 5 * 60_000;
-const DEFAULT_MAX_BUFFERED_BYTES    = 4 * 1_048_576;
+const DEFAULT_REPLAY_WINDOW_MS      = 5  * 60_000;
+const DEFAULT_MAX_BUFFERED_BYTES    = 4  * 1_048_576;
+const DEFAULT_MAX_OUTBOX_BYTES      = 16 * 1_048_576;
 
 const HUB_FEATURES = Object.freeze(['topics', 'direct']);
 
 module.exports = {
   TAG,
   WS_OPEN,
+  WS_CLOSE_REPLACED,
   HUB_FEATURES,
   KIND_PATTERN,
   HELLO_KIND_MAX,
   HELLO_NAME_MAX,
+  DEFAULT_DRAIN_RETRY_MS,
   DEFAULT_MAX_RECENT_IDS,
   DEFAULT_HELLO_TIMEOUT_MS,
   DEFAULT_REPLAY_WINDOW_MS,
+  DEFAULT_MAX_OUTBOX_BYTES,
   DEFAULT_MAX_MESSAGE_BYTES,
   DEFAULT_MAX_BUFFERED_BYTES,
   DEFAULT_MAX_PENDING_SOCKETS,
+  DEFAULT_MAX_CONCURRENT_RPC,
   DEFAULT_KEEPALIVE_INTERVAL_MS
 };

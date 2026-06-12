@@ -20,18 +20,18 @@
  *
  *   # With the bus:
  *   node examples/05-disabled-mode.js
- *   # → connects, ready, publishes the report on a topic
+ *   # > connects, ready, publishes the report on a topic
  *
  *   # Without:
  *   LINK_URL= LINK_SECRET= LINK_KIND= node examples/05-disabled-mode.js
- *   # → "link disabled, running standalone", does the work anyway
+ *   # > "link disabled, running standalone", does the work anyway
  */
 
 const {
     LinkClient,
     LinkNotReadyError,
-    createSafePublisher,
 } = require('../src/index.js');
+const { createSafePublisher } = require('@presenc3/link-helpers');
 
 const fn = '[ Reporter ]';
 

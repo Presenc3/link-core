@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "strict" :   true,
+    "noEmit" :   true,
+    "module" :   "node16",
+    "target" :   "es2022",
+    "types"  : [ "node"   ],
+    "lib"    : [ "es2022" ],
+    "esModuleInterop"    : true,
+    "skipLibCheck"       : false,
+    "noUnusedLocals"     : false,
+    "noUnusedParameters" : false,
+    "moduleResolution"   : "node16",
+    "forceConsistentCasingInFileNames" : true,
+    "exactOptionalPropertyTypes"       : false
+  },
+  "include": [
+    "src/index.d.ts",
+    "src/errors.d.ts",
+    "src/protocol.d.ts",
+    "src/primitives.d.ts",
+    "src/hub/index.d.ts",
+    "test/types/**/*.ts",
+    "src/client/index.d.ts"
+  ]
+}

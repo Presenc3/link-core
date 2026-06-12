@@ -28,12 +28,22 @@ export interface MessageEnvelope<TData = unknown> {
 }
 
 /**
- * Two-method logger. Pass `null` to silence; omit to use the default
- * console-based logger.
+ * The link-core logger contract: four level methods, each called as
+ * `(context, message, ...args)`.
+ *
+ * Anything passed as a `logger` option is adapted internally, so you may
+ * also pass a bare `console`, a minimal `{ log, warn }` object, or a
+ * pre-v0.5 `{ l, lD, lW, lE }` logger. Pass `null` to silence all output;
+ * omit the option to use the default console-based logger.
+ *
+ * `createLogger()` from `@presenc3/link-helpers` returns an object that
+ * already satisfies this interface.
  */
 export interface Logger {
-  log(tag:  string, ...args: unknown[]): void;
-  warn(tag: string, ...args: unknown[]): void;
+  debug(context: string, message?: unknown, ...args: unknown[]): void;
+  info(context:  string, message?: unknown, ...args: unknown[]): void;
+  warn(context:  string, message?: unknown, ...args: unknown[]): void;
+  error(context: string, message?: unknown, ...args: unknown[]): void;
 }
 
 /** A peer description as it appears in `peers.update` and `getState()`. */
@@ -52,14 +62,24 @@ export interface PeerStatus {
 
 /**
  * RPC handler signature. The hub-side `rpcHandlers` and client-side
- * `rpcHandlers` use the same shape: `(rpcData, msg) => result`.
+ * `rpcHandlers` use the same shape: `(rpcData, msg, ctx) => result`.
  *
  * For server-side handlers, `msg.from` is guaranteed to be the authenticated
  * socket's bound `kind` (since v0.3.2) - safe to use for authorization.
+ *
+ * Client-side handlers also receive a third argument `ctx` carrying an
+ * `AbortSignal` (since v0.6). The signal fires if the original caller
+ * cancels the RPC - the hub relays a best-effort `rpc.cancel` - or if the
+ * handling link is torn down. Reading it is optional: a handler that
+ * ignores `ctx` behaves exactly as before. A handler that honours it can
+ * pass `ctx.signal` to AbortSignal-aware APIs (`fetch`, timers, streams)
+ * to bail out of work whose response can no longer be delivered. The hub's
+ * own server-side handlers are not currently passed a `ctx`.
  */
 export type RpcHandler<TIn = any, TOut = any> = (
   data : TIn,
   msg  : MessageEnvelope<{ rpcType: string; rpcData: TIn }>,
+  ctx ?: { signal: AbortSignal },
 ) => Promise<TOut> | TOut;
 
 /**
@@ -67,12 +87,20 @@ export type RpcHandler<TIn = any, TOut = any> = (
  * `ts` defaults to Date.now(), `from` and `to` default to null. `data` is
  * deep-cloned via `structuredClone` so the caller may freely mutate the input
  * after the call without affecting the returned envelope or the bytes that
- * eventually go on the wire.
+ * eventually go on the wire (so it must at minimum be cloneable: functions
+ * and DOM nodes throw here).
  *
- * `data` must be `structuredClone`-compatible: plain objects/arrays, primitives,
- * `Date`, `Map`, `Set`, `Uint8Array`, etc. Functions, class instances with
- * methods, and DOM nodes will throw. If you need to send something exotic,
- * serialize it yourself (e.g. to a base64 string) before calling.
+ * The envelope travels as JSON, and the signature covers exactly the JSON
+ * projection of `data` (`toJSON()` honored, boxed primitives unwrapped) -
+ * so signing and verification are always consistent, but `data` should be
+ * JSON-representable if you want it to *arrive* meaning what you sent.
+ * Values with lossy JSON projections - `Map`/`Set` (become `{}`),
+ * `Uint8Array` (becomes an index-keyed object), `NaN`/`Infinity` (become
+ * `null`) - ship as that projection. `makeMsg` is the low-level primitive
+ * and does not reject them; the high-level `send()`/`publish()`/`rpc()`
+ * APIs validate payloads and throw on lossy values instead. If you need
+ * to send something exotic, serialize it yourself (e.g. binary to a
+ * base64 string) before calling.
  *
  * `algo` selects the HMAC hash algorithm; defaults to `DEFAULT_HASH_ALGO`
  * (`'sha256'`). The same algorithm must be configured on both ends.
@@ -87,6 +115,15 @@ export function makeMsg<T = unknown>(
     from?: string | null;
     to?:   string | null;
     data:  T;
+    /**
+     * When `false`, `makeMsg` does NOT take a defensive `structuredClone`
+     * of `data` and stores the reference directly in the envelope.
+     * Defaults to `true`. Pass `false` only when the caller already owns
+     * an exclusive snapshot of `data` (nothing else can mutate it) - it
+     * is an internal hot-path optimisation, not something most callers
+     * need.
+     */
+    clone?: boolean;
   },
   algo?: string,
 ): MessageEnvelope<T>;
@@ -116,6 +153,24 @@ export function verify(secret: string, msg: unknown, algo?: string): boolean;
  * slots.
  */
 export function stableStringify(obj: unknown): string | undefined;
+
+/**
+ * Throw a `TypeError` if `value` cannot be placed on the JSON wire *with
+ * its meaning intact*.
+ *
+ * Rejects, with a path-bearing message:
+ *   - `BigInt` and circular structures (JSON.stringify throws at send time)
+ *   - non-finite numbers (`NaN` / `Infinity` serialize to `null`)
+ *   - `Map`, `Set`, `RegExp`, `Error`, `Promise` (serialize to `{}`)
+ *   - `ArrayBuffer`, typed arrays, `DataView` (binary does not survive JSON)
+ *
+ * An object with `toJSON()` is validated through its `toJSON()` output,
+ * exactly as `JSON.stringify` will use it - so a `Date` passes (it ships
+ * as a meaningful ISO string). `undefined`, functions, and symbols are
+ * NOT rejected: JSON omits them from objects (nulls them in arrays),
+ * the long-standing convention for optional fields.
+ */
+export function assertJsonSerializable(value: unknown, label?: string): void;
 
 /** Maximum permitted topic length, in characters. */
 export const TOPIC_MAX_LENGTH: number;
@@ -153,6 +208,16 @@ export type TopicHandler<TPayload = unknown> = (
  *   - `oversize`           - message exceeded `maxMessageBytes`.
  *   - `no-ack`             - client-only: saw no verified message within
  *                            `helloAckDiagnosticMs` (likely secret mismatch).
+ *   - `clock-skew`         - client-only: signature-valid messages were
+ *                            dropped for being outside the replay window;
+ *                            the `skew` field carries the last observed
+ *                            skew in ms. Almost always an unsynced clock.
+ *   - `keepalive-timeout`  - client-only: the hub did not answer a
+ *                            liveness ping within `keepaliveIntervalMs`;
+ *                            the socket is being terminated to reconnect.
+ *   - `rpc-response-mismatch` - client-only: an `rpc.response` arrived
+ *                            whose `from` did not match the peer the RPC
+ *                            was sent to; the response was dropped.
  *   - `bad-hello`          - hub-only: hello arrived with a missing,
  *                            oversized, pattern-failing, or reserved
  *                            `kind`. The `detail` field disambiguates:
@@ -179,6 +244,9 @@ export type ProtocolErrorReason =
   | 'missing-id'
   | 'oversize'
   | 'no-ack'
+  | 'clock-skew'
+  | 'keepalive-timeout'
+  | 'rpc-response-mismatch'
   | 'bad-hello'
   | 'duplicate-hello'
   | 'unknown-kind'
@@ -194,7 +262,10 @@ export type ClientProtocolErrorReason =
   | 'replay-id'
   | 'missing-id'
   | 'oversize'
-  | 'no-ack';
+  | 'no-ack'
+  | 'clock-skew'
+  | 'keepalive-timeout'
+  | 'rpc-response-mismatch';
 
 /** Subset of `ProtocolErrorReason` that the `Hub` may emit. */
 export type HubProtocolErrorReason =
@@ -260,11 +331,22 @@ export type LinkErrorCode =
   | 'RPC_DISCONNECT'
   | 'RPC_ABORT'
   | 'RPC_REMOTE'
+  | 'RPC_HANDLER_ERROR'
+  | 'RPC_UNKNOWN_TYPE'
+  | 'RPC_BAD_REQUEST'
+  | 'RPC_NO_TARGET'
+  | 'RPC_TARGET_UNAVAILABLE'
+  | 'RPC_RESULT_NOT_SERIALIZABLE'
+  | 'RPC_FORBIDDEN'
+  | 'PUBLISH_FORBIDDEN'
+  | 'SUBSCRIBE_FORBIDDEN'
+  | 'SEND_FORBIDDEN'
   | 'BACKPRESSURE'
   | 'PROTOCOL_ERROR'
   | 'HELLO_REJECTED'
   | 'LINK_NOT_READY'
-  | 'FEATURE_UNSUPPORTED';
+  | 'FEATURE_UNSUPPORTED'
+  | (string & {});
 
 /**
  * Base class for every error link-core throws or rejects with locally.
@@ -330,17 +412,51 @@ export class RpcAbortError extends RpcError {
 
 /**
  * The remote handler threw, or the hub returned an error response (e.g.
- * `"Target not connected: foo"` when the destination peer is offline,
- * or `"Unknown rpcType: bar"` when no handler is registered).
+ * a missing destination peer, or an unknown rpcType).
  *
- * The wire format only carries an error string, so `.message` is the
- * remote-supplied string verbatim. Useful primarily for `instanceof`
- * discrimination against transport-level errors - code that retries on
- * `RpcTimeoutError`/`RpcDisconnectError` should generally NOT retry on
- * `RpcRemoteError` because the failure is the remote's, not the link's.
+ * By default remote handler errors are *sanitized*: a plain `Error` thrown
+ * by a handler arrives here only as a generic `"Internal handler error"`
+ * with `code === 'RPC_HANDLER_ERROR'`. When the remote handler throws an
+ * `RpcHandlerError` (its deliberate, caller-facing channel), the original
+ * `message`, `code`, and `data` are forwarded and surfaced here verbatim.
+ * Hub-generated failures carry their own codes (`RPC_NO_TARGET`,
+ * `RPC_BAD_REQUEST`, `RPC_TARGET_UNAVAILABLE`).
+ *
+ * Useful primarily for `instanceof` discrimination against transport-level
+ * errors - code that retries on `RpcTimeoutError`/`RpcDisconnectError`
+ * should generally NOT retry on `RpcRemoteError`, since the failure is the
+ * remote's, not the link's.
  */
 export class RpcRemoteError extends RpcError {
-  code: 'RPC_REMOTE';
+  /** The remote-supplied code when present, otherwise `'RPC_REMOTE'`. */
+  code: LinkErrorCode;
+  /** Structured detail forwarded by a remote `RpcHandlerError`, if any. */
+  data?: unknown;
+}
+
+/**
+ * Thrown *inside* an RPC handler to deliberately send a structured,
+ * caller-visible error. Unlike a plain `Error` (which is sanitized to a
+ * generic message before it leaves the process), an `RpcHandlerError` is
+ * forwarded verbatim: its `message`, `code`, and `data` arrive on the
+ * caller side as a matching `RpcRemoteError`.
+ *
+ * Works in both `LinkClient` `rpcHandlers` and hub `rpcHandlers`.
+ */
+export class RpcHandlerError extends RpcError {
+  /** Always `true` - marks the error as intentionally caller-facing. */
+  readonly expose: true;
+  /** Application-defined code; defaults to `'RPC_HANDLER_ERROR'`. */
+  code: LinkErrorCode;
+  /** Optional structured detail forwarded to the caller alongside `message`. */
+  data?: unknown;
+  constructor(message: string, opts?: {
+    code?:    LinkErrorCode;
+    data?:    unknown;
+    to?:      string;
+    rpcType?: string;
+    id?:      string;
+  });
 }
 
 /**
@@ -386,10 +502,13 @@ export class LinkNotReadyError extends LinkError {
  * not advertise the required capability. `feature` is the missing
  * feature name; `op` is the caller-side operation that needed it.
  *
- * Notably fires loud against v0.3.x hubs (which don't advertise any
- * features at all): the v0.4 client treats "no advertisement" as
- * "feature absent" so a publish/send call doesn't silently disappear
- * into a hub that won't act on it.
+ * Fires loud against a hub whose `hello.ack` did not advertise the
+ * capability (including an ack with no feature list at all, which the
+ * client treats as "no features"): a publish/send call must not silently
+ * disappear into a hub that won't act on it. While features are still
+ * *unknown* - connected but no ack yet - feature-dependent sends queue
+ * rather than throw; readiness (and with it the feature list) arrives
+ * with the ack.
  */
 export class FeatureUnsupportedError extends LinkError {
   code:     'FEATURE_UNSUPPORTED';
@@ -447,10 +566,13 @@ export interface LinkClientOptions {
   secret?: string;
   /**
    * Service-type identifier; e.g. `'worker'`. Singleton per hub. Must
-   * match `[a-zA-Z0-9._-]+`, length 1–256 (same character class as topics);
-   * the hub will reject the hello as `'bad-hello'` (`detail: 'invalid-kind'`)
-   * otherwise. Optional - see the `url` note above for the "disabled if
-   * missing" behavior.
+   * match `[a-zA-Z0-9._-]+`, length 1–256 (same character class as
+   * topics), and must not be a reserved kind (`server`, `__proto__`,
+   * `constructor`, `prototype`). The constructor throws a `TypeError` on
+   * violation - the same rules the hub enforces at hello time, applied at
+   * boot so a bad configured kind fails loudly instead of reconnect-looping
+   * against the hub's `'bad-hello'` rejection forever. Optional - see the
+   * `url` note above for the "disabled if missing" behavior.
    */
   kind?:   string;
   /** Human-readable instance name. Defaults to `kind`. */
@@ -459,7 +581,11 @@ export interface LinkClientOptions {
   /** Called on connect and every `statusIntervalMs`; return is sent as `status.update`. */
   makeStatus?: () => unknown;
 
-  /** Map of `rpcType` → handler for incoming RPC requests. */
+  /**
+   * Map of `rpcType` > handler for incoming RPC requests. Every value
+   * must be a function; the constructor throws a `TypeError` otherwise
+   * (the same contract `handle()` enforces at runtime).
+   */
   rpcHandlers?: Record<string, RpcHandler>;
 
   /** Custom logger, or `null` to silence. Defaults to a console-based logger. */
@@ -492,8 +618,13 @@ export interface LinkClientOptions {
   reconnectJitter?:     number;
 
   /**
-   * Time after `open` to wait for any verified message before warning about a
-   * likely secret mismatch. Set to 0 to disable. Default: 5000.
+   * Time after `open` to wait for readiness (the hub's `hello.ack`) before
+   * emitting a diagnostic `protocol-error`. The warning distinguishes the
+   * three "connected but never ready" causes: nothing verified (likely a
+   * secret/hashAlgo mismatch), signature-valid traffic dropped by the
+   * replay window (clock skew), or traffic verified but no `hello.ack`
+   * ever sent (a pre-v0.4 or non-conforming hub - the client only becomes
+   * ready on the ack). Set to 0 to disable. Default: 5000.
    */
   helloAckDiagnosticMs?: number;
 
@@ -515,13 +646,69 @@ export interface LinkClientOptions {
   maxMessageBytes?: number;
 
   /**
-   * Cap on `ws.bufferedAmount` before sends are dropped. Status updates and
-   * fire-and-forget messages (`publish()`, `send()`) are silently dropped
-   * (with a `'backpressure'` event); `rpc()` rejects synchronously with a
-   * `BackpressureError` (`err.code === 'BACKPRESSURE'`).
-   * Default: 4194304 (4 MiB).
+   * Soft cap on `ws.bufferedAmount`. At or below this, outbound messages are
+   * written to the socket immediately; above it, they are queued in the
+   * outbox (see `maxOutboxBytes`) and drained as the socket catches up.
+   * Messages are never dropped for crossing this cap - it only decides
+   * "write now" vs "queue and drain". Default: 4194304 (4 MiB).
    */
   maxBufferedBytes?: number;
+
+  /**
+   * Hard cap, in bytes, on the outbound queue (outbox) - the buffer that
+   * holds messages while the socket is congested or the link is
+   * reconnecting. Queued messages drain automatically once the link is
+   * healthy again. Reaching this cap is the *only* condition under which an
+   * outbound message is refused: `send()`/`publish()` return `false` and an
+   * `'outbox-overflow'` event fires (a loud signal, never a silent drop);
+   * `rpc()` rejects with `BackpressureError`. Default: 16777216 (16 MiB).
+   */
+  maxOutboxBytes?: number;
+
+  /**
+   * Default budget, in ms, for `stop()`'s graceful drain (flush the outbox,
+   * let in-flight RPCs settle, wait for the socket buffer to empty) before
+   * the socket is force-closed. Overridable per call via
+   * `stop({ timeoutMs })`. Default: 5000.
+   */
+  stopDrainMs?: number;
+
+  /**
+   * Maximum number of consecutive failed reconnection attempts before the
+   * client gives up, emits `'reconnect-exhausted'`, and stops. `Infinity`
+   * (the default) means reconnect forever - usually correct for a service
+   * mesh, where the hub may be briefly down for a deploy. The counter
+   * resets to 0 every time the link reaches `'ready'`. Default: `Infinity`.
+   */
+  maxReconnectAttempts?: number;
+
+  /**
+   * `EventEmitter` max-listeners cap for this client. Raised from Node's
+   * default of 10 because the observability and event-recorder helpers each
+   * attach several listeners before any application code does. `0` disables
+   * the cap (per Node's convention). Default: 100.
+   */
+  maxListeners?: number;
+
+  /**
+   * Maximum number of inbound RPC handlers (`rpcHandlers`) allowed to run
+   * concurrently. Once this many are in flight, further `rpc.request`
+   * messages are rejected immediately - the caller receives an
+   * `RpcRemoteError` with `code: 'RPC_OVERLOADED'` - instead of spawning
+   * unbounded handler work. `0` disables the cap. Default: 256.
+   */
+  maxConcurrentRpc?: number;
+
+  /**
+   * Application-level liveness watchdog interval, in milliseconds. The
+   * client pings the hub every `keepaliveIntervalMs`; if a ping goes
+   * unanswered for a full interval the connection is treated as dead and
+   * the socket is terminated, triggering the normal reconnect path. This
+   * detects a wedged hub or a half-open connection that the OS-level TCP
+   * keepalive would otherwise take hours to notice. `0` disables the
+   * watchdog. Default: 30000.
+   */
+  keepaliveIntervalMs?: number;
 
   /**
    * HMAC hash algorithm. Must match the hub. Default: `'sha256'`.
@@ -547,11 +734,26 @@ export interface LinkClientOptions {
    *   - `false` (default) - call `stop()` and stay down. Prevents a hot
    *     reconnect loop when the secret/key registry is misconfigured.
    *     The promise from `ready()` rejects with `HelloRejectedError`.
-   *   - `true`  - keep reconnecting. Useful only if the hub's key
-   *     registry is expected to change while the client is running
-   *     (e.g. the operator hot-rotates a key into the resolver).
+   *   - `true`  - close the socket and keep reconnecting with the normal
+   *     backoff (and subject to `maxReconnectAttempts`). Each `rejected`
+   *     event fires per attempt. Useful only if the hub's key registry is
+   *     expected to change while the client is running (e.g. the operator
+   *     hot-rotates a key into the resolver).
    */
   reconnectOnRejection?: boolean;
+
+  /**
+   * Controls how errors thrown by this client's `rpcHandlers` are reported
+   * to the remote caller.
+   *   - `false` (default) - sanitize. A plain `Error` from a handler reaches
+   *     the caller only as a generic "Internal handler error"; the real
+   *     error is logged and emitted on `'rpc.handler-error'`. Throw an
+   *     `RpcHandlerError` to deliberately forward a message/code/data.
+   *   - `true` - forward every handler error's message verbatim. Convenient in trusted/internal deployments;
+   *     avoid it where an RPC caller is not fully trusted, since handler
+   *     error messages can leak internal detail.
+   */
+  exposeRpcErrors?: boolean;
 }
 
 /**
@@ -576,18 +778,21 @@ export interface LinkClientEvents {
   'verified':        (info: { kind: string }) => void;
 
   /**
-   * The hub accepted our hello (`hello.ack.ok !== false`, OR - for
-   * back-compat with v0.3.x hubs that didn't send hello.ack at all - any
-   * non-rejecting verified message). At this point the reconnect backoff
-   * is reset, locally-tracked subscriptions have been replayed to the
-   * hub, and the status-push timer is armed. This is the gate for
-   * `publish()` / `send()` / `rpc()`.
+   * The hub accepted our hello: a successful `hello.ack` arrived. Since
+   * v0.6.0 this is strictly the *only* trigger - a verified non-ack frame
+   * no longer marks the client ready (the previous v0.3.x-hub
+   * compatibility behavior could flip readiness before the hub's feature
+   * list was known and destroy queued feature-dependent messages). At
+   * this point the reconnect backoff is reset, locally-tracked
+   * subscriptions have been replayed to the hub, and the status-push
+   * timer is armed. This is the gate for `publish()` / `send()` / `rpc()`.
    *
-   * `features` is the capability list announced by the hub in
-   * `hello.ack` (e.g. `['topics','direct']`); `null` if the hub didn't
-   * advertise them; an empty array if it advertised none.
+   * `features` is the capability list announced by the hub in the
+   * `hello.ack` (e.g. `['topics','direct']`); an empty array if the ack
+   * advertised none. It is always a real array here - readiness and the
+   * feature list arrive together.
    */
-  'ready':           (info: { kind: string; features: string[] | null }) => void;
+  'ready':           (info: { kind: string; features: string[] }) => void;
 
   /**
    * The hub rejected the hello (`hello.ack` with `ok: false`). By default
@@ -600,12 +805,19 @@ export interface LinkClientEvents {
   'rejected':        (info: { reason: string; error: string | null }) => void;
 
   /**
-   * WebSocket has closed. `willReconnect` is false after `stop()` or
-   * after a hello rejection (when `reconnectOnRejection` is the default
-   * `false`). `wasReady` indicates whether the link reached the `'ready'`
-   * state during this connection.
+   * WebSocket has closed. `willReconnect` is false after `stop()`, after a
+   * hello rejection when `reconnectOnRejection` is the default `false`, and
+   * when the link was *displaced* (see `displaced`). `wasReady` indicates
+   * whether the link reached the `'ready'` state during this connection.
+   *
+   * `displaced` is `true` when the hub closed this socket because another
+   * connection authenticated as the same `kind`. A displaced link does NOT
+   * auto-reconnect (regardless of `reconnectOnRejection` / reconnect
+   * settings), since reconnecting would just restart a replacement war
+   * between two processes sharing a kind. It almost always indicates a
+   * misconfiguration (two instances using one kind).
    */
-  'disconnect':      (info: { code?: number; reason: string; willReconnect: boolean; wasReady: boolean }) => void;
+  'disconnect':      (info: { code?: number; reason: string; willReconnect: boolean; wasReady: boolean; displaced?: boolean }) => void;
 
   /** A reconnect attempt is scheduled. `attempt` is 1-indexed since last `'ready'`. */
   'reconnecting':    (info: { delayMs: number; attempt: number }) => void;
@@ -616,7 +828,12 @@ export interface LinkClientEvents {
   /** A message was rejected by signature, version, replay, or size checks. */
   'protocol-error':  (info: ClientProtocolErrorInfo) => void;
 
-  /** Power-user firehose: every verified message, post-replay-check. */
+  /**
+   * Power-user firehose: every verified message, post-replay-check.
+   * `msg` is a *snapshot* - mutating it cannot alter how the client
+   * dispatches the message (RPC settlement, topic fan-in, directs). The
+   * snapshot is only taken when at least one listener is attached.
+   */
   'message':         (info: { msg: MessageEnvelope; raw: Buffer | string }) => void;
 
   /** A new peer kind appeared in the latest `peers.update`. */
@@ -647,6 +864,23 @@ export interface LinkClientEvents {
     msg     : MessageEnvelope;
   }) => void;
 
+  /**
+   * An inbound RPC this client is *handling* was cancelled by its original
+   * caller: the hub relayed a best-effort `rpc.cancel` and the matching
+   * in-flight handler's `AbortSignal` has just been fired. Observability
+   * only - the handler may still run to completion if it ignores the
+   * signal, but its eventual response is suppressed (the caller has
+   * already given up). Since v0.6.
+   */
+  'rpc.cancel': (info: {
+    /** The id of the `rpc.request` being cancelled. */
+    id      : string;
+    /** The peer that issued the original request (and the cancel). */
+    from    : string | null;
+    /** The cancelled RPC's `rpcType`. */
+    rpcType : string;
+  }) => void;
+
   /** A pending outbound RPC timed out. */
   'rpc.timeout': (info: {
     id        : string;
@@ -673,7 +907,7 @@ export interface LinkClientEvents {
    * Unified outbound-RPC lifecycle event. Fires exactly once per `rpc()`
    * call, regardless of outcome. `reason` is `null` on success and one of
    * `'timeout' | 'abort' | 'disconnect' | 'not-ready' | 'remote-error' |
-   * 'send-error' | 'backpressure'` on failure. `id` and `durationMs` are
+   * 'backpressure'` on failure. `id` and `durationMs` are
    * always populated, including for synchronous pre-send rejections (those
    * report `durationMs` as the time spent inside `rpc()` itself, typically
    * 0).
@@ -687,23 +921,80 @@ export interface LinkClientEvents {
     to        : string;
     rpcType   : string;
     ok        : boolean;
-    reason    : 'timeout' | 'abort' | 'disconnect' | 'not-ready' | 'remote-error' | 'send-error' | 'backpressure' | null;
+    reason    : 'timeout' | 'abort' | 'disconnect' | 'not-ready' | 'remote-error' | 'backpressure' | null;
     durationMs: number;
     error     : string | null;
   }) => void;
 
   /**
-   * The local WebSocket's `bufferedAmount` exceeded `maxBufferedBytes` and a
-   * send was dropped. For status updates, `publish()`, and `send()` the
-   * message is silently dropped (after this event fires); for `rpc()` the
-   * call rejects synchronously with a `BackpressureError`
-   * (`err.code === 'BACKPRESSURE'`).
+   * The socket became congested and an outbound message was queued in the
+   * outbox rather than written immediately. Edge-triggered: fires once when
+   * the outbox transitions from empty to non-empty, not once per message.
+   * The message is *not* dropped (`queued: true`) - it drains automatically
+   * and an `'outbox-drained'` event fires when the queue empties again.
    */
   'backpressure': (info: {
     type: string;
     to?: string | null;
     rpcType?: string;
     bufferedAmount: number;
+    queued?: boolean;
+    outboxSize?: number;
+  }) => void;
+
+  /**
+   * The outbound queue hit its `maxOutboxBytes` cap and a message was
+   * refused. This is the only condition under which an outbound message is
+   * not delivered: the corresponding `send()`/`publish()` returned `false`,
+   * or `rpc()` rejected with `BackpressureError`.
+   */
+  'outbox-overflow': (info: {
+    type: string;
+    to: string | null;
+    outboxBytes: number;
+    maxOutboxBytes: number;
+  }) => void;
+
+  /** The outbound queue finished draining (emptied) after a congestion episode. */
+  'outbox-drained': (info: {}) => void;
+
+  /**
+   * A queued outbound message could not be serialized (its payload is not
+   * structured-cloneable) and was dropped rather than retried forever.
+   * Programmer payloads passed to `send` / `publish` / `rpc` are validated
+   * up front and throw synchronously instead; this event therefore only
+   * fires for internally-generated messages (e.g. a non-cloneable RPC
+   * handler result or `makeStatus()` return value).
+   */
+  'outbox-error': (info: {
+    type: string;
+    to: string | null;
+    id: string;
+    error: string;
+  }) => void;
+
+  /**
+   * The reconnect ceiling (`maxReconnectAttempts`) was reached: the client
+   * has given up and stopped, and will not attempt to reconnect again.
+   * Only fires when `maxReconnectAttempts` is finite.
+   */
+  'reconnect-exhausted': (info: {
+    attempts: number;
+    maxReconnectAttempts: number;
+  }) => void;
+
+  /**
+   * A local RPC handler (registered via `rpcHandlers` or `handle()`) threw
+   * an error that was *not* an `RpcHandlerError` - i.e. an unintended fault.
+   * The remote caller received a sanitized "Internal handler error"; this
+   * event carries the real error for local logging/metrics. Does not fire
+   * when `exposeRpcErrors` is `true`, nor for deliberate `RpcHandlerError`s.
+   */
+  'rpc.handler-error': (info: {
+    rpcType: string;
+    from:    string | null;
+    id:      string;
+    error:   unknown;
   }) => void;
 
   /**
@@ -730,9 +1021,15 @@ export interface RpcOptions {
   timeoutMs?: number;
   /**
    * Optional `AbortSignal`. Aborting it rejects the pending RPC with an
-   * `RpcAbortError` and removes the pending entry. The wire request is
-   * not cancelled - the remote handler may still complete and the
-   * response will be logged-and-dropped on arrival.
+   * `RpcAbortError` and removes the pending entry.
+   *
+   * As of v0.6, the client also sends a best-effort `rpc.cancel` to the
+   * hub on abort (and on a `timeoutMs` deadline). If the request is still
+   * queued for a congested target, the hub drops it before the target
+   * ever sees it (the hub fires `'rpc.cancelled'` with `found: true`). If
+   * the request was already forwarded, the remote handler still runs to
+   * completion as before and its response is logged-and-dropped on
+   * arrival - the local rejection is unaffected either way.
    */
   signal?: AbortSignal;
 }
@@ -797,6 +1094,12 @@ export interface HealthSnapshot {
   bufferedAmount: number;
   /** Reconnect attempts since the last `'ready'`. 0 when healthy. */
   reconnectAttempt: number;
+  /** Messages currently waiting in the outbound queue (outbox). */
+  outboxSize: number;
+  /** Approximate total bytes held in the outbound queue. */
+  outboxBytes: number;
+  /** Inbound RPC handlers currently executing (see `maxConcurrentRpc`). */
+  inFlightRpc: number;
   /** `stop()` has been called. */
   stopped: boolean;
 }
@@ -816,15 +1119,16 @@ export class LinkClient extends EventEmitter {
   peers           : PeerInfo[];
 
   /**
-   * Capability list announced by the hub in its `hello.ack`. `null` until
-   * the first verified message arrives; an empty array if the hub didn't
-   * advertise any features (i.e. a v0.3.x hub). Use to pre-flight feature
-   * availability before invoking it: `link.hubFeatures?.includes('topics')`.
+   * Capability list announced by the hub in its `hello.ack`. `null` while
+   * features are unknown - i.e. until the ack arrives and the client
+   * becomes ready (while `null`, feature-dependent sends queue rather
+   * than throw). An empty array if the acking hub advertised none. Use to
+   * pre-flight feature availability: `link.hubFeatures?.includes('topics')`.
    */
   hubFeatures: string[] | null;
 
   /**
-   * Map of `rpcType` → handler. Initially populated from
+   * Map of `rpcType` > handler. Initially populated from
    * `LinkClientOptions.rpcHandlers`; mutate it via `handle()` / `unhandle()`
    * rather than direct assignment so plugin-style "register on link-up"
    * patterns are tidy.
@@ -842,10 +1146,22 @@ export class LinkClient extends EventEmitter {
   start(): void;
 
   /**
-   * Close, cancel timers, reject pending RPCs with `RpcDisconnectError`.
-   * The client will not auto-reconnect after `stop()`.
+   * Stop the link. By default this is a *graceful* stop: it flushes the
+   * outbound queue, lets in-flight RPCs settle, and waits for the socket's
+   * send buffer to empty - all bounded by `opts.timeoutMs` (default: the
+   * `stopDrainMs` constructor option) - before closing. Pass
+   * `{ drain: false }` for an immediate close that rejects pending RPCs
+   * with `RpcDisconnectError` without draining.
+   *
+   * Always resolves and never rejects: a drain timeout is logged and the
+   * socket force-closed anyway. When there is nothing in flight to drain,
+   * the close happens synchronously before the returned promise settles,
+   * so callers that do not `await` still see an immediate teardown.
+   *
+   * The client will not auto-reconnect after `stop()`; call `start()` to
+   * bring it back up.
    */
-  stop(): void;
+  stop(opts?: { drain?: boolean; timeoutMs?: number }): Promise<void>;
 
   /** True if the WebSocket is open. (Not necessarily verified - see `'verified'` event.) */
   isConnected(): boolean;
@@ -877,7 +1193,7 @@ export class LinkClient extends EventEmitter {
    *   - `RpcAbortError`       - `opts.signal` fired.
    *   - `RpcRemoteError`      - remote handler threw, or hub returned an
    *                             error response (e.g. target offline).
-   *   - `BackpressureError`   - local send buffer over cap (synchronous).
+   *   - `BackpressureError`   - the outbound queue is full (`maxOutboxBytes`).
    *   - plain `Error`         - `ws.send()` itself threw (very rare).
    */
   rpc<TOut = any, TIn = any>(
@@ -889,10 +1205,12 @@ export class LinkClient extends EventEmitter {
 
   /**
    * Directed fire-and-forget. The third primitive alongside `rpc()` and
-   * `publish()`. Returns `true` if the message was sent, `false` if it was
-   * dropped due to local backpressure (in which case `'backpressure'` was
-   * emitted). Throws synchronously if the link is not connected/ready
-   * or the hub doesn't advertise the `'direct'` feature.
+   * `publish()`. Returns `true` if the message was sent or queued in the
+   * outbox, `false` only if the outbox is full (an `'outbox-overflow'`
+   * event also fires). A not-yet-connected or reconnecting link queues the
+   * message rather than failing - it drains once the link is ready. Throws
+   * synchronously only for invalid arguments, a disabled or stopped link,
+   * or a hub that does not advertise the `'direct'` feature.
    *
    * Receiver subscribes to the `'direct'` event for `{ from, type, data, msg }`.
    */
@@ -968,14 +1286,20 @@ export class LinkClient extends EventEmitter {
    * handlers for the topic. Returns true if anything was removed locally.
    * The hub-side subscription is dropped only when the last handler for the
    * topic is removed.
+   *
+   * Throws synchronously if the topic name is invalid (matching
+   * `subscribe()` / `publish()`); an invalid topic is a programmer error,
+   * not a silent no-op.
    */
   unsubscribe(topic: string, handler?: TopicHandler<any>): boolean;
 
   /**
-   * Publish to a topic. At-most-once: throws synchronously if the link is
-   * disconnected/not-ready or the hub doesn't support topics. Returns
-   * `false` if the message was dropped due to local backpressure (in which
-   * case `'backpressure'` was emitted), `true` if it was sent.
+   * Publish to a topic. Returns `true` if the message was sent or queued in
+   * the outbox, `false` only on outbox overflow (an `'outbox-overflow'`
+   * event also fires). A not-yet-connected or reconnecting link queues the
+   * message rather than failing. Throws synchronously only for an invalid
+   * topic, a disabled or stopped link, or a hub without the `'topics'`
+   * feature.
    */
   publish<TPayload = unknown>(topic: string, payload: TPayload): boolean;
 
@@ -1038,6 +1362,74 @@ export interface HubHealthSnapshot {
   recentIdsSize: number;
   /** Number of peers with a remembered last-status. */
   statusCount: number;
+  /** Total bytes currently queued across all per-socket outboxes. */
+  outboxBytes: number;
+  /** Number of peer sockets with a non-empty outbox (congested consumers). */
+  queuedSockets: number;
+  /** Hub-handled (`to: 'server'`) RPCs currently executing (see `maxConcurrentRpc`). */
+  serverRpcInFlight: number;
+}
+
+/**
+ * The verdict an ACL callback (`canRpc` / `canPublish` / `canSubscribe` /
+ * `canSend`) returns to authorize or reject a hub operation:
+ *
+ *   - `true`                       - allow
+ *   - `false`                      - deny (generic `Forbidden`)
+ *   - `{ ok: true }`               - allow
+ *   - `{ ok: false, code?, error? }` - deny; `code` / `error` are surfaced
+ *                                      to the caller (for RPC) and on the
+ *                                      `'acl-denied'` hub event
+ *
+ * An ACL callback may return the verdict synchronously or as a `Promise`.
+ * The gate fails *closed*: any other return value (`undefined`, `null`,
+ * ...), or a thrown error, is treated as a denial and logged.
+ */
+export type HubAclVerdict =
+  | boolean
+  | { ok: true }
+  | { ok: false; code?: string; error?: string };
+
+/** Context passed to {@link CreateHubOptions.canRpc}. */
+export interface CanRpcContext {
+  /** Authenticated kind of the calling peer. */
+  from: string;
+  /** RPC destination - a peer kind, or `'server'` for a hub-handled RPC. */
+  to: string | null;
+  /** The application-defined RPC type. */
+  rpcType: string | undefined;
+  /** The RPC request payload. */
+  rpcData: unknown;
+}
+
+/** Context passed to {@link CreateHubOptions.canPublish}. */
+export interface CanPublishContext {
+  /** Authenticated kind of the publishing peer. */
+  from: string;
+  /** Topic being published to. */
+  topic: string;
+  /** The published payload. */
+  payload: unknown;
+}
+
+/** Context passed to {@link CreateHubOptions.canSubscribe}. */
+export interface CanSubscribeContext {
+  /** Authenticated kind of the subscribing peer. */
+  from: string;
+  /** Topic being subscribed to. */
+  topic: string;
+}
+
+/** Context passed to {@link CreateHubOptions.canSend}. */
+export interface CanSendContext {
+  /** Authenticated kind of the sending peer. */
+  from: string;
+  /** Destination peer kind. */
+  to: string;
+  /** The application-defined directed-message type. */
+  type: string;
+  /** The directed-message payload. */
+  data: unknown;
 }
 
 export interface CreateHubOptions {
@@ -1045,6 +1437,42 @@ export interface CreateHubOptions {
   secret: HubSecretResolver;
   rpcHandlers?: Record<string, RpcHandler>;
   logger?: Logger | null;
+
+  /**
+   * Optional authorization gate for peer-to-peer (and `to: 'server'`)
+   * RPCs. Runs after the `rpc.request` is verified and the caller's
+   * `from` identity is established, before the hub forwards it or hands
+   * it to a server handler. A denial sends the caller a structured
+   * `rpc.response` error (surfacing as an `RpcRemoteError` whose `code`
+   * is the verdict's `code`, defaulting to `'RPC_FORBIDDEN'`) and fires
+   * the `'acl-denied'` hub event. Omit for no RPC authorization.
+   */
+  canRpc?: (ctx: CanRpcContext) => HubAclVerdict | Promise<HubAclVerdict>;
+
+  /**
+   * Optional authorization gate for topic publishes. Runs after the
+   * `topic.message` is verified and the topic validated, before fan-out.
+   * A denial drops the message and fires `'acl-denied'` (publish is
+   * fire-and-forget, so there is no caller-facing error). Omit for no
+   * publish authorization.
+   */
+  canPublish?: (ctx: CanPublishContext) => HubAclVerdict | Promise<HubAclVerdict>;
+
+  /**
+   * Optional authorization gate for topic subscriptions. Runs after the
+   * `topic.subscribe` is verified and the topic validated, before the
+   * subscription is recorded. A denial drops the subscribe and fires
+   * `'acl-denied'`. Omit for no subscribe authorization.
+   */
+  canSubscribe?: (ctx: CanSubscribeContext) => HubAclVerdict | Promise<HubAclVerdict>;
+
+  /**
+   * Optional authorization gate for directed (`link.send`) messages.
+   * Runs after the `direct` message is verified, before it is forwarded
+   * to its target. A denial drops the message and fires `'acl-denied'`.
+   * Omit for no directed-send authorization.
+   */
+  canSend?: (ctx: CanSendContext) => HubAclVerdict | Promise<HubAclVerdict>;
 
   /** Keep-alive ping interval in ms (post-hello sockets only). Default: 15000. */
   keepaliveIntervalMs?: number;
@@ -1064,12 +1492,21 @@ export interface CreateHubOptions {
   maxMessageBytes?: number;
 
   /**
-   * Cap on a peer's `ws.bufferedAmount` before sends to that peer are dropped.
-   * Per-peer, so a single slow consumer doesn't block fan-out to others.
-   * Drops are logged. RPC forwards return an error response to the original
-   * caller. Default: 4194304 (4 MiB).
+   * Cap on a peer's `ws.bufferedAmount` before sends to that peer switch
+   * from immediate writes to being queued in that peer's outbox. Per-peer,
+   * so a single slow consumer doesn't block fan-out to others.
+   * Default: 4194304 (4 MiB).
    */
   maxBufferedBytes?: number;
+
+  /**
+   * Hard cap, in bytes, on each peer's outbound queue (outbox) - the buffer
+   * that holds messages while that peer's socket is congested. Messages
+   * drain automatically as the socket catches up; reaching this cap is the
+   * only condition under which the hub drops a message (a loud
+   * `outbox-overflow` event fires). Default: 16777216 (16 MiB) per socket.
+   */
+  maxOutboxBytes?: number;
 
   /**
    * Time after a socket connects to wait for a successful `hello` before
@@ -1089,12 +1526,34 @@ export interface CreateHubOptions {
   maxPendingSockets?: number;
 
   /**
+   * Maximum number of hub-handled (`to: 'server'`) RPC handlers allowed to
+   * run concurrently. Past this many in flight, further server RPCs are
+   * rejected with an `RpcHandlerError` carrying `code: 'RPC_OVERLOADED'`.
+   * `0` disables the cap. Default: 256.
+   */
+  maxConcurrentRpc?: number;
+
+  /**
    * HMAC hash algorithm for sign/verify. Must match the clients.
    * Default: `'sha256'`.
    */
   hashAlgo?: string;
+
+  /**
+   * Controls how errors thrown by hub-side `rpcHandlers` (server RPCs) are
+   * reported to the calling peer. `false` (default) sanitizes: a plain
+   * `Error` reaches the caller as a generic "Internal handler error" and
+   * the real error stays in the hub log. `true` forwards handler error
+   * messages verbatim. Either way, a deliberately-thrown `RpcHandlerError`
+   * is always forwarded with its message/code/data intact.
+   */
+  exposeRpcErrors?: boolean;
 }
 
+/**
+ * The `getState()` snapshot. Deep-cloned: mutating it (or anything inside
+ * it) cannot affect hub state, later broadcasts, or later snapshots.
+ */
 export interface HubState {
   peers      : PeerInfo[];
   lastStatus : Record<string, { status: unknown; at: number }>;
@@ -1133,10 +1592,17 @@ export interface HubEvents {
     newHello:  unknown | null;
   }) => void;
 
-  /** A pre-hello socket exceeded `helloTimeoutMs` and was force-closed. */
+  /**
+   * A pre-hello socket was force-closed. Either it exceeded
+   * `helloTimeoutMs` without sending a valid `hello`
+   * (`reason: 'hello-timeout'`), or it was evicted because the pre-hello
+   * pool was already at `maxPendingSockets` when a new connection
+   * arrived (`reason: 'pending-cap'`).
+   */
   'peer.timeout': (info: {
     remoteAddress: string | null;
     helloTimeoutMs: number;
+    reason: 'hello-timeout' | 'pending-cap';
   }) => void;
 
   /** A message was dropped at the hub. See `HubProtocolErrorReason` for the catalog. */
@@ -1153,8 +1619,19 @@ export interface HubEvents {
     from:            string;
     topic:           string;
     payload:         unknown;
+    /**
+     * Number of *eligible recipients* for the fan-out: peers subscribed to
+     * the topic, excluding the publisher itself (self-delivery is off, so
+     * the publisher is never a recipient even if it is subscribed).
+     *
+     * Because of this, `delivered <= subscriberCount` always holds, and
+     * `delivered === subscriberCount` on a fully successful fan-out.
+     * `delivered` is lower only when a subscriber's socket was unavailable
+     * (closed or backpressured to overflow) at send time.
+     */
     subscriberCount: number;
-    delivered?:      number;
+    /** Recipients the message was actually queued/sent to. Always present. */
+    delivered:       number;
   }) => void;
 
   /** An rpc.request was forwarded to its target peer. */
@@ -1191,16 +1668,107 @@ export interface HubEvents {
     data: unknown;
   }) => void;
 
-  /** A send to a peer was dropped due to backpressure on that peer's socket. */
+  /**
+   * An `rpc.cancel` from a caller was processed. Fires whether or not a
+   * queued request was actually found: `found` is `true` only when a
+   * still-queued `rpc.request` (one sitting in a congested target's
+   * outbox) was located and removed. `found: false` is the common case -
+   * the request had already been written to the wire, or never queued,
+   * or `to` was `'server'` (server RPCs are never queued).
+   *
+   * When `found` is `false` and the target is still connected, the hub
+   * relays the `rpc.cancel` to the target peer so an in-flight handler
+   * honouring its `AbortSignal` can bail early; `forwarded` is `true` in
+   * that case. `forwarded` is always `false` when the cancel was already
+   * satisfied by dropping a queued request, when `to` was `'server'`, or
+   * when the target was no longer connected.
+   */
+  'rpc.cancelled': (info: {
+    /** The id of the cancelled `rpc.request`. */
+    id:    string;
+    /** The peer that issued the cancel (the original caller). */
+    from:  string;
+    /** The cancelled RPC's destination. */
+    to:    string;
+    /** True iff a queued request was found and dropped. */
+    found: boolean;
+    /** True iff the cancel was relayed on to a still-connected target. */
+    forwarded: boolean;
+  }) => void;
+
+  /**
+   * An operation was rejected by one of the ACL callbacks (`canRpc`,
+   * `canPublish`, `canSubscribe`, `canSend`). Observability-only - the
+   * hub has already dropped the operation (and, for RPC, already replied
+   * to the caller with a structured error).
+   */
+  'acl-denied': (info: {
+    /** Which gate denied the operation. */
+    op:       'rpc' | 'publish' | 'subscribe' | 'send';
+    /** Authenticated kind of the peer whose operation was denied. */
+    from:     string;
+    /** The verdict's code (e.g. `'RPC_FORBIDDEN'`). */
+    code:     string;
+    /** The verdict's human-readable reason. */
+    error:    string;
+    /** Present for `op: 'rpc'` and `op: 'send'`. */
+    to?:      string | null;
+    /** Present for `op: 'rpc'`. */
+    rpcType?: string;
+    /** Present for `op: 'publish'` and `op: 'subscribe'`. */
+    topic?:   string;
+    /** Present for `op: 'send'` (the directed-message type). */
+    type?:    string;
+  }) => void;
+
+  /**
+   * A send to a peer found that peer's socket congested, so the message was
+   * queued in that socket's outbox rather than written immediately.
+   * Edge-triggered: fires once when the socket's outbox goes from empty to
+   * non-empty. The message is not dropped (`queued: true`) - it drains as
+   * the socket catches up.
+   */
   'backpressure': (info: {
-    kind:             string;
+    kind:             string | null;
     type:             string;
     to?:              string | null;
     bufferedAmount:   number;
     maxBufferedBytes: number;
+    queued?:          boolean;
+    outboxSize?:      number;
   }) => void;
 
-  /** Power-user firehose: every verified message that reached the hub. */
+  /**
+   * A peer's per-socket outbox hit its `maxOutboxBytes` cap and a message
+   * was dropped - the only condition under which the hub still drops. The
+   * peer is effectively a dead-slow consumer.
+   */
+  'outbox-overflow': (info: {
+    kind:           string | null;
+    type:           string;
+    to?:            string | null;
+    outboxBytes:    number;
+    maxOutboxBytes: number;
+  }) => void;
+
+  /**
+   * A queued outbound message could not be serialized (non-cloneable
+   * payload) and was dropped rather than retried forever. Typically a
+   * non-cloneable hub `rpcHandlers` return value.
+   */
+  'outbox-error': (info: {
+    kind:  string | null;
+    type:  string;
+    to?:   string | null;
+    id:    string;
+    error: string;
+  }) => void;
+
+  /**
+   * Power-user firehose: every verified message that reached the hub.
+   * `msg` is a *snapshot* - mutating it cannot alter routing or dispatch.
+   * The snapshot is only taken when at least one listener is attached.
+   */
   'message': (info: { from: string | null; msg: MessageEnvelope }) => void;
 }
 
@@ -1236,7 +1804,10 @@ export interface CreateHubServerOptions extends CreateHubOptions {
   /** Bind interface. Default: '0.0.0.0'. Ignored if `server` is provided. */
   host?: string;
 
-  /** Bind port. Default: 8080. Ignored if `server` is provided. */
+  /**
+   * Bind port: an integer in [0, 65535] (0 = pick an ephemeral port).
+   * Default: 8080. Ignored if `server` is provided.
+   */
   port?: number;
 
   /**
@@ -1252,14 +1823,14 @@ export interface CreateHubServerOptions extends CreateHubOptions {
   routes?: Record<string, HttpRouteHandler>;
 
   /**
-   * Adds GET /health → `{ ok, now, hub: hub.health() }`. Default: true.
+   * Adds GET /health > `{ ok, now, hub: hub.health() }`. Default: true.
    * Ignored when `server` is provided. The `hub` field was added in v0.4.x
    * (see `HubHealthSnapshot`).
    */
   enableHealthRoute?: boolean;
 
   /**
-   * Adds GET /state → `getState()` + extraState(). **Default: `false`** as
+   * Adds GET /state > `getState()` + extraState(). **Default: `false`** as
    * of v0.5.0** (previously `true`); /state exposes peer kinds, hello
    * payloads, and last-known statuses, which is fine for an internal
    * dashboard but undesirable on a public bind. Opt in explicitly when
@@ -1310,6 +1881,7 @@ export interface HubServer {
   getState()               : HubState;
   /** Convenience pass-through to `hub.health()`. */
   health()                 : HubHealthSnapshot;
+  /** True while the server is up: latched by `start()` once listening, cleared when `stop()` completes. */
   readonly isStarted       : boolean;
   readonly isStopping      : boolean;
   /** True after `stop()` has fully torn the server down. `createHubServer` is single-shot; once this latches `true`, `start()` will throw. */
@@ -1318,492 +1890,3 @@ export interface HubServer {
 }
 
 export function createHubServer(options: CreateHubServerOptions): HubServer;
-
-export type LogLevel = 0 | 1 | 2 | 3;
-
-export interface LogLevels {
-  readonly DEBUG: 0;
-  readonly INFO:  1;
-  readonly WARN:  2;
-  readonly ERROR: 3;
-}
-
-export const LEVELS: LogLevels;
-
-export type LogLevelName = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-                        | 'debug' | 'info' | 'warn' | 'error';
-
-export type LogFn = (context: string, message?: unknown, ...args: unknown[]) => void;
-
-export type ErrorSink = (
-  context: string,
-  message: unknown,
-  error: Error,
-) => void | Promise<void>;
-
-/**
- * The rich logger object returned by `createLogger`. Extends `Logger`
- * (the two-method `{ log, warn }` shim that `LinkClient` / `createHub`
- * / `createHubServer` accept as their `logger` option) so a
- * `LeveledLogger` can be passed straight in - no adapter needed:
- *
- *   const log  = createLogger();
- *   const link = new LinkClient({ ..., logger: log });
- *
- * `log` is the `l` (INFO) function; `warn` is `lW` (WARN). The
- * adapter form `{ log: leveled.l, warn: leveled.lW }` still works for
- * back-compat, but it's no longer required.
- *
- * `warn` is mapped to `lW` (not `lE`) on purpose - `LinkClient` uses
- * `logger.warn` for routine drops (backpressure, replayed messages,
- * signature mismatches, transient ws errors) and routing those into
- * an error sink would flood it on every misconfigured-secret
- * reconnect.
- */
-export interface LeveledLogger extends Logger {
-  readonly LEVELS: LogLevels;
-  l:  LogFn;
-  lD: LogFn;
-  lW: LogFn;
-  lE: LogFn;
-  /** Alias of `l` (INFO) - satisfies the {@link Logger} interface. */
-  log:  LogFn;
-  /** Alias of `lW` (WARN) - satisfies the {@link Logger} interface. */
-  warn: LogFn;
-  setMinLevel(value: LogLevel | LogLevelName): void;
-  setErrorSink(fn: ErrorSink | null): void;
-  clearErrorSink(): void;
-}
-
-export interface CreateLoggerOptions {
-  /** number (LEVELS.*) or string ('DEBUG'|'INFO'|'WARN'|'ERROR'). Default: NODE_ENV='production' → INFO else DEBUG. */
-  minLevel?: LogLevel | LogLevelName;
-  /** Mirror Error instances to a sink (e.g. webhook, Sentry). */
-  errorSink?: ErrorSink;
-  /** Override the timestamp prefix. Default: ISO 'HH:MM:SS.mmm'. */
-  timestamp?: () => string;
-}
-
-export function createLogger(opts?: CreateLoggerOptions): LeveledLogger;
-
-export function num(v: unknown): number | undefined;
-export function bool(v: unknown): boolean | undefined;
-
-export function requireEnv<K extends string>(
-  keys: readonly K[],
-  env?: NodeJS.ProcessEnv,
-): Record<K, string>;
-
-/**
- * The subset of `LinkClientOptions` that `linkClientOptionsFromEnv` knows
- * how to read from the environment. Deliberately a subset, not exhaustive:
- * the per-call timing knobs (`defaultRpcTimeoutMs`, `statusIntervalMs`,
- * `helloAckDiagnosticMs`) and the reconnect-timing knobs
- * (`reconnectInitialMs`, `reconnectMaxMs`, `reconnectGrowth`) are usually
- * pinned in code per service rather than per deployment, so they're not
- * env-mapped here. If you need them from env, layer your own
- * `num(process.env.X)` onto the returned object.
- */
-export interface LinkClientEnvOptions {
-  url?: string;
-  secret?: string;
-  kind?: string;
-  hashAlgo?: string;
-  perMessageDeflate?: boolean;
-  reconnectOnRejection?: boolean;
-  reconnectJitter?: number;
-  replayWindowMs?: number;
-  maxRecentIds?: number;
-  maxMessageBytes?: number;
-  maxBufferedBytes?: number;
-}
-
-export interface LinkClientOptionsFromEnvOpts {
-  /** Read FOO_URL/FOO_KIND/etc instead of LINK_*. Default: 'LINK_'. */
-  envPrefix?: string;
-}
-
-export function linkClientOptionsFromEnv(
-  env?: NodeJS.ProcessEnv,
-  opts?: LinkClientOptionsFromEnvOpts,
-): LinkClientEnvOptions;
-
-export const DEFAULT_CLIENT_CONCERNING_REASONS: readonly string[];
-export const DEFAULT_HUB_CONCERNING_REASONS:    readonly string[];
-
-export interface AttachObservabilityOptions {
-  logger: LeveledLogger;
-  /** Log context prefix. Defaults to 'link' (client) or 'hub' (hub). */
-  context?: string;
-  /** Promote per-RPC traces (and verbose hub events) to info. */
-  verbose?: boolean;
-  /** Override the default reason set entirely. */
-  concerningReasons?: readonly string[];
-  /** Add to the default reason set. */
-  extraConcerningReasons?: readonly string[];
-}
-
-export function attachClientObservability(
-  link: LinkClient,
-  opts: AttachObservabilityOptions,
-): void;
-
-export function attachHubObservability(
-  hub: EventEmitter,
-  opts: AttachObservabilityOptions,
-): void;
-
-export interface WaitForPeerOptions {
-  /**
-   * Reject with an `Error` after this many ms if no matching peer is
-   * seen. 0 means "no timeout" (matches `link.ready()` / `link.waitFor()` /
-   * `link.rpc()` semantics). Default 30_000.
-   */
-  timeoutMs?: number;
-  /** Default true - only return when the peer is currently connected. */
-  requireConnected?: boolean;
-  /**
-   * Optional `AbortSignal`. Aborting rejects the helper with an error
-   * whose `name` is `'AbortError'`. An already-aborted signal rejects
-   * synchronously. Since v0.5.0 - earlier versions silently ignored this
-   * option.
-   */
-  signal?: AbortSignal;
-}
-
-export function waitForPeer(
-  link: LinkClient,
-  kind: string,
-  opts?: WaitForPeerOptions,
-): Promise<PeerInfo>;
-
-export interface RpcWithRetryOptions {
-  tries?: number;
-  timeoutMs?: number;
-  /** Backoff = baseDelayMs * attempt + jitter. Default 250. */
-  baseDelayMs?: number;
-  signal?: AbortSignal;
-}
-
-export function rpcWithRetry<T = unknown>(
-  link: LinkClient,
-  to: string,
-  type: string,
-  data: unknown,
-  opts?: RpcWithRetryOptions,
-): Promise<T>;
-
-export interface CreateSafePublisherOptions {
-  logger: Pick<LeveledLogger, 'lD' | 'lW'>;
-  context?: string;
-  /** Pre-check `link.hubFeatures.includes('topics')`. Default false. */
-  featureCheck?: boolean;
-}
-
-export function createSafePublisher(
-  link: LinkClient,
-  opts: CreateSafePublisherOptions,
-): (topic: string, payload: unknown) => boolean;
-
-export interface CreateSafeSendOptions {
-  logger: Pick<LeveledLogger, 'lD' | 'lW'>;
-  context?: string;
-  /** Pre-check `link.hubFeatures.includes('direct')`. Default false. */
-  featureCheck?: boolean;
-}
-
-export function createSafeSend(
-  link: LinkClient,
-  opts: CreateSafeSendOptions,
-): (to: string, type: string, data: unknown) => boolean;
-
-export type ShutdownFn = (signal?: string) => Promise<void> | void;
-export type ShutdownStep = (signal?: string) => unknown;
-
-export interface InstallProcessHandlersOptions {
-  shutdown: ShutdownFn;
-  logger: LeveledLogger;
-  context?: string;
-  signals?: readonly NodeJS.Signals[];
-  /** Default true. When false, uncaughtException is logged but not exited. */
-  exitOnUncaught?: boolean;
-}
-
-export function installProcessHandlers(
-  opts: InstallProcessHandlersOptions,
-): () => void;
-
-export interface CreateGracefulShutdownOptions {
-  logger: LeveledLogger;
-  context?: string;
-  /** Default 30_000. Use 0 to disable the watchdog. */
-  timeoutMs?: number;
-  /** Default 0. */
-  exitCode?: number;
-  /** Steps run in order; throws are logged but don't stop the chain. */
-  steps?: readonly ShutdownStep[];
-  /** Default true. Set false to skip process.exit (useful in tests). */
-  exitProcess?: boolean;
-}
-
-export function createGracefulShutdown(
-  opts: CreateGracefulShutdownOptions,
-): ShutdownFn;
-
-export interface SecretChangeEvent {
-  name: string;
-  path: string;
-  action: 'set' | 'del';
-  oldValue: string | null | undefined;
-  newValue: string | null;
-}
-
-export interface LoadSecretsOptions {
-  /** Cumulative budget for ready + peer wait + every get. Default 30_000. */
-  timeoutMs?: number;
-  /** Vault peer kind. Default 'link_secs'. */
-  secretsKind?: string;
-  /** Subscribe to secs.changed.<ns> and refetch on rotation. v0.4+ hub. */
-  watch?: boolean;
-  /** Called on every observed change once watch is on. */
-  onChange?: (ev: SecretChangeEvent) => void;
-  /**
-   * Optional `LeveledLogger`. Only `lW` is read - used for transient
-   * watch-reload failures (vault refused / timed out / disconnected
-   * mid-rotation; or the helper rejected a rotation event from a peer
-   * other than the configured vault). Falls back to a `console.warn`
-   * wrapper if absent. Since v0.5.
-   */
-  logger?: Pick<LeveledLogger, 'lW'>;
-}
-
-/**
- * Well-known Symbol that may be present as a non-enumerable property on
- * the object returned by `loadSecrets(..., { watch: true })`. Calling
- * the value at this key tears down the rotation-event subscriptions
- * the helper installed. Idempotent; only removes the helper's own
- * subscriptions (caller-installed handlers on the same topic are
- * untouched). Absent (and the lookup is `undefined`) for non-watch
- * loads.
- *
- *   const { loadSecrets, LOADED_SECRETS_UNWATCH } = require('@presenc3/link-core');
- *   const cfg = await loadSecrets(link, mapping, { watch: true });
- *   // ...
- *   cfg[LOADED_SECRETS_UNWATCH]?.();
- *
- * Symbol-keyed (rather than e.g. a `.close` method) so the cleanup
- * handle cannot collide with a secret whose env name happens to be
- * `close`. Since v0.5.
- */
-export const LOADED_SECRETS_UNWATCH: unique symbol;
-
-/**
- * Return shape of `loadSecrets`. Always carries the requested env-name
- * keys as strings; additionally carries the symbol-keyed unwatch handle
- * iff `opts.watch === true`. The symbol property is non-enumerable, so
- * `JSON.stringify(cfg)` / `Object.keys(cfg)` only see the secret values.
- */
-export type LoadedSecrets = Record<string, string> & {
-  [LOADED_SECRETS_UNWATCH]?: () => void;
-};
-
-export function loadSecrets(
-  link: LinkClient,
-  mapping: Record<string, string>,
-  opts?: LoadSecretsOptions,
-): Promise<LoadedSecrets>;
-
-/**
- * A single recorded event in the ring buffer. The `kind` taxonomy
- * mirrors what the hub emits, normalized for dashboard display:
- *
- *   'hub-up'         the LinkClient just became `ready`
- *   'hub-down'       the LinkClient disconnected
- *   'rejected'       the hub rejected our hello (`hello.ack ok:false`)
- *   'protocol-error' the LinkClient dropped an incoming message
- *   'backpressure'   the LinkClient dropped an outgoing message
- *   'join'           a peer connected to the hub
- *   'leave'          a peer disconnected from the hub
- *   'replace'        a same-kind peer reconnected with a fresh socket
- *   'status'         a peer published a status update
- *   'rpc-fail'       an outbound `rpc()` call failed
- *   'direct'         an inbound directed message
- *
- * The `t` field is always present and is `Date.now()` at record time.
- */
-export interface RecordedEvent {
-  kind:
-    | 'hub-up'
-    | 'hub-down'
-    | 'rejected'
-    | 'protocol-error'
-    | 'backpressure'
-    | 'join'
-    | 'leave'
-    | 'replace'
-    | 'status'
-    | 'rpc-fail'
-    | 'direct';
-  /**
-   * Origin of the event:
-   *   'link_server'   originated from the hub side of the wire
-   *   'self'          originated from this LinkClient
-   *   <peer-kind>     originated from the named peer
-   */
-  from: string | null | undefined;
-  t: number;
-  /** Other fields vary by `kind` - see the implementation for the schema per kind. */
-  [extra: string]: unknown;
-}
-
-/**
- * Self-identity projection in the snapshot. Mirrors what the LinkClient
- * was constructed with (`kind` / `name`) plus the hub's advertised
- * `features` once `'ready'` has fired.
- */
-export interface RecorderSelf {
-  kind:     string;
-  name:     string | null;
-  /** Null until `link.hubFeatures` is populated (first verified message). */
-  features: string[] | null;
-}
-
-/**
- * The shape `getSnapshot()` and the `'snapshot'` event deliver. Designed
- * to be JSON-stringified and shipped over an SSE stream (or any other
- * dashboard transport) as-is. Every field is a fresh value per call.
- */
-export interface RecorderSnapshot {
-  /** Mirror of `link.isConnected()` at snapshot time. */
-  connected: boolean;
-  /** Mirror of `link.isReady()` at snapshot time. */
-  ready:     boolean;
-  /**
-   * Identity projection. `null` if the LinkClient has no `kind` set
-   * (shouldn't happen for a started client, but the recorder doesn't
-   * assume).
-   */
-  self:      RecorderSelf | null;
-  /** Latest peer list from `link.getPeers()`. */
-  peers:     readonly PeerInfo[];
-  /** `kind` -> last-known status for every peer the LinkClient has tracked. */
-  statuses:  Record<string, PeerStatus>;
-  /** Stamp passed to `createEventRecorder` (or `Date.now()` at construction). */
-  startedAt: number;
-  /** `link.health()` snapshot, or `null` if it threw / is unavailable. */
-  health:    HealthSnapshot | null;
-  /** Copy of the ring buffer at snapshot time. */
-  eventLog:  RecordedEvent[];
-  /** `Date.now()` at snapshot build time. */
-  at:        number;
-  /**
-   * Trigger that produced the snapshot. Present on auto-emitted snapshots
-   * (`'tick'`, `'ready'`, `'rejected'`, `'disconnect'`, `'peer.connect'`,
-   * `'peer.disconnect'`, `'peer.status'`, `'initial'`) and absent when
-   * `getSnapshot()` is called directly by user code.
-   */
-  _reason?:  string;
-}
-
-export interface CreateEventRecorderOptions {
-  /** Max recorded events; oldest evicted on overflow. Default 30. */
-  ringSize?: number;
-  /** Periodic snapshot-emit cadence in ms. 0 disables the heartbeat. Default 1000. */
-  heartbeatIntervalMs?: number;
-  /** Stamp included in `snapshot.startedAt`. Default `Date.now()` at construction. */
-  startedAt?: number;
-}
-
-/**
- * Function returned by `onSnapshot()` / `onEvent()`. Calling it removes
- * the subscriber. Idempotent.
- */
-export type RecorderUnsubscribe = () => void;
-
-/**
- * The object returned by `createEventRecorder`. Extends `EventEmitter` so
- * `recorder.on('snapshot', ...)` / `recorder.on('event', ...)` work
- * alongside the imperative `onSnapshot` / `onEvent` subscriber helpers.
- *
- * The recorder never emits `'error'` - subscriber throws are caught and
- * surfaced via `process.emitWarning` so the host process keeps running.
- */
-export interface EventRecorder extends EventEmitter {
-  /** Effective ring size after option clamping. */
-  readonly ringSize: number;
-  /** Effective heartbeat interval after option clamping; 0 means disabled. */
-  readonly heartbeatIntervalMs: number;
-  /** Effective `startedAt` stamp - shows up in every snapshot. */
-  readonly startedAt: number;
-
-  /** Build a fresh snapshot from the current LinkClient state + ring buffer. */
-  getSnapshot(): RecorderSnapshot;
-
-  /** Copy of the ring buffer at call time. */
-  getRecent(): RecordedEvent[];
-
-  /**
-   * Subscribe to snapshots. The subscriber is called synchronously with
-   * the current snapshot first (so a fresh SSE connection doesn't wait
-   * up to one heartbeat for its first frame), then on every subsequent
-   * emit. Subscriber throws are caught.
-   */
-  onSnapshot(fn: (snap: RecorderSnapshot) => void): RecorderUnsubscribe;
-
-  /**
-   * Subscribe to recorded events. Called on each newly-recorded event.
-   * Does NOT replay the ring buffer - call `getRecent()` first if history
-   * is needed. Subscriber throws are caught.
-   */
-  onEvent(fn: (evt: RecordedEvent) => void): RecorderUnsubscribe;
-
-  /**
-   * Detach all LinkClient listeners, clear the heartbeat, and drop all
-   * subscribers. Idempotent. After `close()`, the recorder no longer
-   * emits and accessors return the snapshot-at-close-time state.
-   */
-  close(): void;
-}
-
-/**
- * Build an `EventRecorder` bound to a LinkClient. The recorder attaches
- * listeners to a fixed set of LinkClient events (see
- * `RECORDED_CLIENT_EVENTS`) and pushes each into a bounded ring buffer
- * with a normalized `RecordedEvent` shape. A subset of those events
- * (`SNAPSHOT_TRIGGERS`) also fire a snapshot emit; on top of that, an
- * optional heartbeat emits a snapshot at a fixed cadence so idle
- * dashboards stay live.
- */
-export function createEventRecorder(
-  link: LinkClient,
-  opts?: CreateEventRecorderOptions,
-): EventRecorder;
-
-/**
- * Client events the recorder listens to. Stable - changing this is a
- * breaking change to the snapshot wire format.
- */
-export const RECORDED_CLIENT_EVENTS: readonly (
-  | 'ready'
-  | 'rejected'
-  | 'disconnect'
-  | 'protocol-error'
-  | 'backpressure'
-  | 'peer.connect'
-  | 'peer.disconnect'
-  | 'peer.replaced'
-  | 'peer.status'
-  | 'rpc.complete'
-  | 'direct'
-)[];
-
-/** Subset of `RECORDED_CLIENT_EVENTS` whose arrival also fires a snapshot emit. */
-export const SNAPSHOT_TRIGGERS: readonly (
-  | 'ready'
-  | 'rejected'
-  | 'disconnect'
-  | 'peer.connect'
-  | 'peer.disconnect'
-  | 'peer.replaced'
-  | 'peer.status'
-)[];

@@ -44,7 +44,7 @@ const link = new LinkClient({
   secret : process.env.LINK_KEY_VAULT || 'dev-vault-key',
 
   rpcHandlers: {
-    // secrets.get({ name }) → { name, value }
+    // secrets.get({ name }) > { name, value }
     'secrets.get': async ({ name } = {}, msg) => {
 
       // The string is what shows up on the caller's RpcRemoteError.message
@@ -62,15 +62,15 @@ const link = new LinkClient({
         `Unknown secret: ${name}`
       );
 
-      console.log(`${fn} secrets.get(${name}) → ${msg.from}`);
+      console.log(`${fn} secrets.get(${name}) > ${msg.from}`);
       return { name, value };
     },
 
-    // secrets.list() → { names: string[] }
+    // secrets.list() > { names: string[] }
     'secrets.list': async (_data, msg) => {
       if (!ALLOW.has(msg.from)) throw new Error(`Forbidden: ${msg.from}`);
 
-      console.log(`${fn} secrets.list → ${msg.from}`);
+      console.log(`${fn} secrets.list > ${msg.from}`);
       return { names: Object.keys(STORE) };
     },
   },

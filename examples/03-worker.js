@@ -26,10 +26,10 @@
 
 const {
   LinkClient,
-  waitForPeer,     rpcWithRetry,
   RpcDisconnectError,
   RpcTimeoutError, RpcRemoteError,
 } = require('../src/index.js');
+const { waitForPeer, rpcWithRetry } = require('@presenc3/link-helpers');
 
 const fn   = '[ Worker ]';
 const NAME = `worker-${process.pid}`;
@@ -102,9 +102,9 @@ link.on('protocol-error', ({ reason })   => console.warn (`${fn} protocol-error:
 
   /*
    * Fetch the DB password with bounded retry. rpcWithRetry's policy:
-   *   - RpcRemoteError → throw immediately (vault said no, don't retry)
-   *   - RpcAbortError  → throw immediately (caller cancelled)
-   *   - RpcTimeoutError or RpcDisconnectError → retry, with jittered
+   *   - RpcRemoteError > throw immediately (vault said no, don't retry)
+   *   - RpcAbortError  > throw immediately (caller cancelled)
+   *   - RpcTimeoutError or RpcDisconnectError > retry, with jittered
    *     backoff = baseDelayMs * attempt + jitter
    */
   try {

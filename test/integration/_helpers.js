@@ -83,4 +83,30 @@ function makeReadyClient(hub, { defaultTimeoutMs = 3000 } = {}) {
 /** Small async sleep helper - used to let the bus settle between sends. */
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
-module.exports = { setupHub, makeReadyClient, tick, DEFAULT_SECRET };
+/**
+ * Poll `predicate` until it returns truthy, or throw after `timeoutMs`.
+ * A causal alternative to a fixed `tick()` for proving that distributed
+ * state has arrived (a subscription registered on the hub, a request
+ * queued in a congested outbox, a cancel round-tripped). Resolves with
+ * the predicate's truthy return value so callers can use what it found.
+ *
+ * Use this - not `tick()` - whenever an assertion depends on a state
+ * transition that crosses the wire: `tick()` is a wall-clock guess that
+ * silently turns into a flaky failure under CPU load, while `waitFor`
+ * waits exactly as long as the state actually takes (and no longer).
+ */
+async function waitFor(predicate, { timeoutMs = 3000, intervalMs = 10, label } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let v;
+    try { v = await predicate(); }
+    catch { v = false; }
+    if (v) return v;
+    if (Date.now() >= deadline) {
+      throw new Error(`waitFor: timed out after ${timeoutMs}ms${label ? ` waiting for ${label}` : ''}`);
+    }
+    await tick(intervalMs);
+  }
+}
+
+module.exports = { setupHub, makeReadyClient, tick, waitFor, DEFAULT_SECRET };

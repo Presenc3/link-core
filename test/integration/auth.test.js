@@ -7,7 +7,7 @@
  * parallel with the other integration files without colliding.
  */
 
-const { test, describe } = require('node:test');
+const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert');
 
 const {
@@ -18,7 +18,7 @@ const {
   FeatureUnsupportedError, createHubServer, makeMsg,
 } = require('../../src/index.js');
 
-const { setupHub, makeReadyClient, tick, DEFAULT_SECRET } = require('./_helpers.js');
+const { setupHub, makeReadyClient, tick, waitFor, DEFAULT_SECRET } = require('./_helpers.js');
 
 const PORT   = 19400;
 const URL    = `ws://127.0.0.1:${PORT}`;
@@ -63,7 +63,7 @@ describe('per-peer keys', () => {
     c.on('rejected',       () => { rejectedFired = true; });
     c.on('protocol-error', (i) => { if (i.reason === 'no-ack') noAckFired = true; });
     c.start();
-    await tick(200);
+    await waitFor(() => noAckFired || rejectedFired, { label: 'no-ack diagnostic' });
     assert.strictEqual(rejectedFired, false, 'hub does NOT confirm kind existence');
     assert.ok(noAckFired,                    'client emits no-ack diagnostic');
     c.stop();
@@ -87,34 +87,40 @@ describe('per-peer keys', () => {
 });
 
 describe('hello sanitization', () => {
-  test('hub rejects hello with spaces in kind (KIND_PATTERN)', async () => {
-    const c = new LinkClient({
-      url: URL, secret: SECRET, kind: 'kind with spaces',
-      logger: null, helloAckDiagnosticMs: 0,
-      reconnectInitialMs: 50, reconnectMaxMs: 50,
+
+  /** Open a bare ws and send one signed hello claiming `kind`. */
+  function rawHello(kind) {
+    const WS = require('ws');
+    const ws = new WS(URL);
+    ws.on('error', () => {});
+    ws.on('open', () => {
+      ws.send(JSON.stringify(makeMsg(SECRET, {
+        id: `raw-${Math.random().toString(36).slice(2)}`,
+        type: 'hello',
+        data: { kind, name: 'raw', pid: process.pid, startedAt: Date.now() },
+      })));
     });
+    return ws;
+  }
+
+  test('hub rejects hello with spaces in kind (KIND_PATTERN)', async () => {
     const events = [];
     harness.hub.on('protocol-error', (i) => events.push(i));
-    c.start();
+    const ws = rawHello('kind with spaces');
     await tick(150);
     const badHello = events.find((e) => e.reason === 'bad-hello');
     assert.ok(badHello, 'expected bad-hello protocol-error');
     assert.strictEqual(badHello.detail, 'invalid-kind');
-    c.stop();
+    try { ws.close(); } catch {}
   });
 
   test('hub rejects hello with control chars in kind', async () => {
-    const c = new LinkClient({
-      url: URL, secret: SECRET, kind: 'worker\nINJECTED',
-      logger: null, helloAckDiagnosticMs: 0,
-      reconnectInitialMs: 50, reconnectMaxMs: 50,
-    });
     const events = [];
     harness.hub.on('protocol-error', (i) => events.push(i));
-    c.start();
+    const ws = rawHello('worker\nINJECTED');
     await tick(150);
     assert.ok(events.find((e) => e.reason === 'bad-hello' && e.detail === 'invalid-kind'));
-    c.stop();
+    try { ws.close(); } catch {}
   });
 
   test('hub rejects hello with empty kind (missing-kind detail)', async () => {

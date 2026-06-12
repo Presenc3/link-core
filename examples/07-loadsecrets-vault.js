@@ -46,7 +46,7 @@ const link = new LinkClient({
 
     rpcHandlers: {
         /*
-         * secs.get({ path }) → { value }
+         * secs.get({ path }) > { value }
          *
          * `path` is the full `sec/<ns>/<rest>` string. Returning
          * `{ value: null }` (or omitting `value`) signals "missing" to
@@ -57,7 +57,7 @@ const link = new LinkClient({
             if (typeof path !== 'string' || !path) throw new Error('secs.get: "path" is required');
             
             const value = STORE[path];
-            console.log(`${fn} secs.get(${path}) → ${msg.from} ${value ? '(hit)' : '(miss)'}`);
+            console.log(`${fn} secs.get(${path}) > ${msg.from} ${value ? '(hit)' : '(miss)'}`);
             return { value: value ?? null };
         },
     },
@@ -83,7 +83,7 @@ link.on('rejected',       ({ reason }) => console.error(`${fn} hub rejected hell
         const oldValue = STORE[path];
         STORE[path]    = `tok-${crypto.randomUUID().slice(0, 8)}`;
 
-        console.log(`${fn} rotated ${path}: ${oldValue} → ${STORE[path]}`);
+        console.log(`${fn} rotated ${path}: ${oldValue} > ${STORE[path]}`);
 
         /*
          * Publish on `secs.changed.<ns>` where <ns> is the first segment
@@ -93,8 +93,6 @@ link.on('rejected',       ({ reason }) => console.error(`${fn} hub rejected hell
         try {
             link.publish('secs.changed.shared', { path, action: 'set' });
         } catch (e) {
-            // LinkNotReadyError mid-reconnect, FeatureUnsupportedError on a
-            // v0.3 hub - both are non-fatal here
             console.warn(`${fn} rotation announce failed: ${e.message}`);
         }
     }, 8_000).unref?.();

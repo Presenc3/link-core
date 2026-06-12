@@ -16,7 +16,7 @@ const fn = '[ Hub ]';
 const PORT = Number(process.env.LINK_PORT) || 8080;
 
 /*
- * Static map of kind → key. The hub silently drops hellos for kinds
+ * Static map of kind > key. The hub silently drops hellos for kinds
  * that aren't in the map (without confirming whether the kind exists,
  * on purpose - see Security & threat model in the README). For a real
  * deployment, swap this for a function that reads from your secrets

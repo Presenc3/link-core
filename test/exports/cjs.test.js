@@ -2,24 +2,18 @@
 
 /**
  * Export smoke tests (CJS).
- *
  * Locks in the public surface that ships in the npm tarball:
+ *   require('@presenc3/link-core')   - root barrel (flat surface)
  *
- *   require('@presenc3/link-core')           - root barrel (flat surface)
- *   require('@presenc3/link-core/helpers')   - helpers subpath
- *
- * If you add a new public symbol, add it here. If a test fails because a
- * name is missing, you probably forgot to re-export it from one of the
- * barrels (`src/index.js`, `src/helpers/index.js`) or its ESM mirror.
- *
- * The ESM-side mirror lives in `./esm.test.mjs`; the two must stay in sync.
+ * Companion helpers moved to @presenc3/link-helpers and are no longer
+ * exported here. The ESM-side mirror lives in `./esm.test.mjs`; the two
+ * must stay in sync.
  */
 
 const { test } = require('node:test');
 const assert = require('node:assert');
 
-const root    = require('../../src/index.js');
-const helpers = require('../../src/helpers/index.js');
+const root = require('../../src/index.js');
 
 const EXPECTED_ROOT_EXPORTS = [
   // Classes / factories
@@ -29,36 +23,15 @@ const EXPECTED_ROOT_EXPORTS = [
 
   // Protocol helpers
   'sign', 'verify', 'makeMsg',
-  'isValidTopic', 'assertValidTopic', 'stableStringify',
+  'isValidTopic', 'assertValidTopic', 'stableStringify', 'assertJsonSerializable',
   'PROTOCOL_VERSION', 'TOPIC_MAX_LENGTH', 'DEFAULT_HASH_ALGO',
 
   // Typed errors
   'LinkError', 'ProtocolError',
-  'RpcError', 'RpcAbortError', 'RpcRemoteError',
+  'RpcError', 'RpcAbortError', 'RpcRemoteError', 'RpcHandlerError',
   'RpcTimeoutError', 'RpcDisconnectError',
   'BackpressureError', 'LinkNotReadyError',
   'HelloRejectedError', 'FeatureUnsupportedError',
-
-  // Helpers - flat at root
-  'createLogger', 'LEVELS',
-  'num', 'bool', 'requireEnv', 'linkClientOptionsFromEnv',
-  'waitForPeer', 'rpcWithRetry', 'createSafeSend', 'createSafePublisher',
-  'installProcessHandlers', 'createGracefulShutdown',
-  'attachClientObservability', 'attachHubObservability',
-  'DEFAULT_CLIENT_CONCERNING_REASONS', 'DEFAULT_HUB_CONCERNING_REASONS',
-  'loadSecrets', 'LOADED_SECRETS_UNWATCH',
-  'createEventRecorder', 'RECORDED_CLIENT_EVENTS', 'SNAPSHOT_TRIGGERS',
-];
-
-const EXPECTED_HELPERS_EXPORTS = [
-  'createLogger', 'LEVELS',
-  'num', 'bool', 'requireEnv', 'linkClientOptionsFromEnv',
-  'waitForPeer', 'rpcWithRetry', 'createSafeSend', 'createSafePublisher',
-  'installProcessHandlers', 'createGracefulShutdown',
-  'attachClientObservability', 'attachHubObservability',
-  'DEFAULT_CLIENT_CONCERNING_REASONS', 'DEFAULT_HUB_CONCERNING_REASONS',
-  'loadSecrets', 'LOADED_SECRETS_UNWATCH',
-  'createEventRecorder', 'RECORDED_CLIENT_EVENTS', 'SNAPSHOT_TRIGGERS',
 ];
 
 test('CJS root: every expected symbol is exported', () => {
@@ -89,28 +62,15 @@ test('CJS root: total export count matches the contract', () => {
   );
 });
 
-test('CJS helpers subpath: every expected symbol is exported', () => {
-  for (const name of EXPECTED_HELPERS_EXPORTS) {
-    assert.ok(
-      Object.prototype.hasOwnProperty.call(helpers, name),
-      `missing helpers export: ${name}`,
-    );
-    assert.notStrictEqual(helpers[name], undefined, `helpers.${name} is undefined`);
-  }
-});
-
-test('CJS helpers subpath: no unexpected symbols', () => {
-  const actual = new Set(Object.keys(helpers));
-  const expected = new Set(EXPECTED_HELPERS_EXPORTS);
-  const extras = [...actual].filter((k) => !expected.has(k));
-  assert.deepStrictEqual(extras, [], `unexpected helpers exports: ${extras.join(', ')}`);
-});
-
-test('helpers symbols are identity-equal to their root counterparts', () => {
-  for (const name of EXPECTED_HELPERS_EXPORTS) {
+test('CJS root: helper symbols are NOT exported (moved to @presenc3/link-helpers)', () => {
+  for (const gone of [
+    'createLogger', 'loadSecrets', 'createGracefulShutdown',
+    'attachClientObservability', 'createEventRecorder', 'linkClientOptionsFromEnv',
+    'waitForPeer', 'rpcWithRetry', 'createSafePublisher',
+  ]) {
     assert.strictEqual(
-      helpers[name], root[name],
-      `helpers.${name} and root.${name} should be the same reference`,
+      Object.prototype.hasOwnProperty.call(root, gone), false,
+      `root should no longer export helper '${gone}' (it lives in @presenc3/link-helpers)`,
     );
   }
 });
@@ -119,12 +79,11 @@ test('classes are constructible / factories are callable', () => {
   assert.strictEqual(typeof root.LinkClient,       'function');
   assert.strictEqual(typeof root.createHub,        'function');
   assert.strictEqual(typeof root.createHubServer,  'function');
-  assert.strictEqual(typeof root.createLogger,     'function');
   assert.strictEqual(typeof root.makeMsg,          'function');
 
   for (const name of [
     'LinkError', 'ProtocolError',
-    'RpcError', 'RpcAbortError', 'RpcRemoteError',
+    'RpcError', 'RpcAbortError', 'RpcRemoteError', 'RpcHandlerError',
     'RpcTimeoutError', 'RpcDisconnectError',
     'BackpressureError', 'LinkNotReadyError',
     'HelloRejectedError', 'FeatureUnsupportedError',

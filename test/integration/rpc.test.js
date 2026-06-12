@@ -14,6 +14,7 @@ const {
   LinkClient,
   RpcRemoteError,          RpcDisconnectError,
   RpcAbortError,           RpcTimeoutError,
+  RpcHandlerError,
   BackpressureError,       LinkNotReadyError,
   FeatureUnsupportedError, createHubServer, makeMsg,
 } = require('../../src/index.js');
@@ -38,23 +39,85 @@ describe('rpc (peer-routed)', () => {
     a.stop(); b.stop();
   });
 
-  test('remote handler throw → RpcRemoteError with full context', async () => {
+  test('plain handler error is sanitized > caller gets a generic RpcRemoteError', async () => {
     const a = await readyClient({ kind: 'rpc-a2' });
+    const handlerErrors = [];
     const b = await readyClient({ kind: 'rpc-b2', rpcHandlers: {
-      boom: async () => { throw new Error('kaboom'); },
+      boom: async () => { throw new Error('kaboom: secret-db://u:p@10.0.0.5'); },
     } });
+    b.on('rpc.handler-error', (i) => handlerErrors.push(i));
+
     let caught;
     try { await a.rpc('rpc-b2', 'boom', {}); } catch (e) { caught = e; }
+
     assert.ok(caught instanceof RpcRemoteError);
-    assert.strictEqual(caught.code,    'RPC_REMOTE');
     assert.strictEqual(caught.to,      'rpc-b2');
     assert.strictEqual(caught.rpcType, 'boom');
     assert.ok(typeof caught.id === 'string' && caught.id.length > 0);
-    assert.match(caught.message, /kaboom/);
+    assert.doesNotMatch(caught.message, /kaboom|secret-db/);
+    assert.strictEqual(caught.message, 'Internal handler error');
+    assert.strictEqual(caught.code,    'RPC_HANDLER_ERROR');
+    assert.strictEqual(handlerErrors.length, 1);
+    assert.match(String(handlerErrors[0].error?.message), /kaboom/);
+    assert.strictEqual(handlerErrors[0].rpcType, 'boom');
     a.stop(); b.stop();
   });
 
-  test('missing peer → RpcRemoteError from hub ("Target not connected")', async () => {
+  test('RpcHandlerError forwards message + code + data to the caller', async () => {
+    const a = await readyClient({ kind: 'rpc-a2b' });
+    const handlerErrors = [];
+    const b = await readyClient({ kind: 'rpc-b2b', rpcHandlers: {
+      lookup: async () => {
+        throw new RpcHandlerError('Order not found', {
+          code: 'ORDER_NOT_FOUND',
+          data: { orderId: 42 },
+        });
+      },
+    } });
+    b.on('rpc.handler-error', (i) => handlerErrors.push(i));
+
+    let caught;
+    try { await a.rpc('rpc-b2b', 'lookup', {}); } catch (e) { caught = e; }
+
+    assert.ok(caught instanceof RpcRemoteError);
+    assert.strictEqual(caught.message, 'Order not found');
+    assert.strictEqual(caught.code,    'ORDER_NOT_FOUND');
+    assert.deepStrictEqual(caught.data, { orderId: 42 });
+    assert.strictEqual(handlerErrors.length, 0,
+      'rpc.handler-error must not fire for a deliberate RpcHandlerError');
+    a.stop(); b.stop();
+  });
+
+  test('exposeRpcErrors: true forwards a plain handler error verbatim', async () => {
+    const a = await readyClient({ kind: 'rpc-a2c' });
+    const b = await readyClient({
+      kind: 'rpc-b2c',
+      exposeRpcErrors: true,
+      rpcHandlers: { boom: async () => { throw new Error('raw detail'); } },
+    });
+
+    let caught;
+    try { await a.rpc('rpc-b2c', 'boom', {}); } catch (e) { caught = e; }
+
+    assert.ok(caught instanceof RpcRemoteError);
+    assert.match(caught.message, /raw detail/);
+    a.stop(); b.stop();
+  });
+
+  test('unknown rpcType reaches the caller as a helpful RpcRemoteError', async () => {
+    const a = await readyClient({ kind: 'rpc-a2d' });
+    const b = await readyClient({ kind: 'rpc-b2d' });
+
+    let caught;
+    try { await a.rpc('rpc-b2d', 'no-such-handler', {}); } catch (e) { caught = e; }
+
+    assert.ok(caught instanceof RpcRemoteError);
+    assert.match(caught.message, /unknown rpctype/i);
+    assert.strictEqual(caught.code, 'RPC_UNKNOWN_TYPE');
+    a.stop(); b.stop();
+  });
+
+  test('missing peer > RpcRemoteError from hub ("Target not connected")', async () => {
     const a = await readyClient({ kind: 'rpc-a3' });
     let caught;
     try { await a.rpc('ghost', 'whatever', {}); } catch (e) { caught = e; }
@@ -63,7 +126,7 @@ describe('rpc (peer-routed)', () => {
     a.stop();
   });
 
-  test('timeout → RpcTimeoutError', async () => {
+  test('timeout > RpcTimeoutError', async () => {
     const a = await readyClient({ kind: 'rpc-a4' });
     const b = await readyClient({ kind: 'rpc-b4', rpcHandlers: {
       hang: () => new Promise(() => {}),
@@ -76,7 +139,7 @@ describe('rpc (peer-routed)', () => {
     a.stop(); b.stop();
   });
 
-  test('AbortSignal in flight → RpcAbortError', async () => {
+  test('AbortSignal in flight > RpcAbortError', async () => {
     const a = await readyClient({ kind: 'rpc-a5' });
     const b = await readyClient({ kind: 'rpc-b5', rpcHandlers: {
       slow: () => new Promise((r) => setTimeout(() => r('late'), 1000)),
@@ -92,7 +155,7 @@ describe('rpc (peer-routed)', () => {
     a.stop(); b.stop();
   });
 
-  test('pre-aborted signal → RpcAbortError before any wire send', async () => {
+  test('pre-aborted signal > RpcAbortError before any wire send', async () => {
     const a = await readyClient({ kind: 'rpc-a6' });
     const ac = new AbortController(); ac.abort();
     let caught;
@@ -103,7 +166,7 @@ describe('rpc (peer-routed)', () => {
     a.stop();
   });
 
-  test('disconnect mid-flight → RpcDisconnectError', async () => {
+  test('disconnect mid-flight > RpcDisconnectError', async () => {
     const a = await readyClient({ kind: 'rpc-a7' });
     const b = await readyClient({ kind: 'rpc-b7', rpcHandlers: {
       hang: () => new Promise(() => {}),
@@ -111,7 +174,7 @@ describe('rpc (peer-routed)', () => {
     const p = a.rpc('rpc-b7', 'hang', {}, 5000);
     p.catch(() => {});
     await tick();
-    a.stop();
+    a.stop({ drain: false });
     let caught;
     try { await p; } catch (e) { caught = e; }
     assert.ok(caught instanceof RpcDisconnectError);
@@ -123,6 +186,37 @@ describe('rpc (peer-routed)', () => {
     const h = await a.rpc('server', 'link.health', {});
     assert.ok(typeof h.peerCount === 'number');
     a.stop();
+  });
+
+  test('server-rpc: a throwing hub handler is sanitized; RpcHandlerError is forwarded', async () => {
+    const srv = createHubServer({
+      secret: SECRET, port: 19201, logger: null, handleSignals: false,
+      rpcHandlers: {
+        leaky:      () => { throw new Error('internal hub path /etc/secret'); },
+        structured: () => { throw new RpcHandlerError('quota exceeded', { code: 'QUOTA' }); },
+      },
+    });
+    await srv.start();
+    try {
+      const a = new LinkClient({ url: 'ws://127.0.0.1:19201', secret: SECRET, kind: 'srv-rpc-a', logger: null });
+      await a.ready({ timeoutMs: 2000 });
+
+      let leaky;
+      try { await a.rpc('server', 'leaky', {}); } catch (e) { leaky = e; }
+      assert.ok(leaky instanceof RpcRemoteError);
+      assert.strictEqual(leaky.message, 'Internal handler error');
+      assert.doesNotMatch(leaky.message, /etc\/secret/);
+
+      let structured;
+      try { await a.rpc('server', 'structured', {}); } catch (e) { structured = e; }
+      assert.ok(structured instanceof RpcRemoteError);
+      assert.strictEqual(structured.message, 'quota exceeded');
+      assert.strictEqual(structured.code,    'QUOTA');
+
+      a.stop();
+    } finally {
+      await srv.stop();
+    }
   });
 
   test('throws synchronously on invalid "to" (matches send/subscribe semantics)', async () => {
@@ -163,7 +257,7 @@ describe('rpc (peer-routed)', () => {
     a.stop();
   });
 
-  test('stop() emits rpc.disconnect for orphaned pending RPCs', async () => {
+  test('stop({ drain: false }) emits rpc.disconnect for orphaned pending RPCs', async () => {
     const a = await readyClient({ kind: 'stop-emit-a' });
     const b = await readyClient({
       kind: 'stop-emit-b',
@@ -177,10 +271,26 @@ describe('rpc (peer-routed)', () => {
     p.catch(() => {});
     await tick(30);
 
-    a.stop();
+    a.stop({ drain: false });
     await assert.rejects(p, RpcDisconnectError);
-    assert.strictEqual(disconnects.length, 1, 'rpc.disconnect must fire when stop() orphans an RPC');
+    assert.strictEqual(disconnects.length, 1, 'rpc.disconnect must fire when a hard stop orphans an RPC');
     assert.strictEqual(disconnects[0].rpcType, 'hang');
+    b.stop();
+  });
+
+  test('graceful stop() lets an in-flight RPC finish before closing', async () => {
+    const a = await readyClient({ kind: 'gstop-a' });
+    const b = await readyClient({
+      kind: 'gstop-b',
+      rpcHandlers: { slow: () => new Promise((r) => setTimeout(() => r({ done: true }), 120)) },
+    });
+
+    const p = a.rpc('gstop-b', 'slow', {}, 5000);
+    await tick(20);
+
+    await a.stop();
+    const result = await p;
+    assert.deepStrictEqual(result, { done: true }, 'graceful stop must not orphan an in-flight RPC');
     b.stop();
   });
 });
@@ -223,8 +333,8 @@ describe('rpc.complete', () => {
     assert.ok(events[0].id);
   });
 
-  test('fires for backpressure with reason="backpressure" (the new behavior)', async () => {
-    const a = await readyClient({ kind: 'cp-bp', maxBufferedBytes: 10 });
+  test('fires for backpressure with reason="backpressure" (outbox overflow)', async () => {
+    const a = await readyClient({ kind: 'cp-bp', maxBufferedBytes: 10, maxOutboxBytes: 64 });
     const events = [];
     a.on('rpc.complete', (i) => events.push(i));
     Object.defineProperty(a.ws, 'bufferedAmount', { get: () => 1_000_000, configurable: true });
@@ -235,7 +345,7 @@ describe('rpc.complete', () => {
     assert.strictEqual(events.length, 1);
     assert.strictEqual(events[0].reason, 'backpressure');
     assert.ok(events[0].id);
-    a.stop();
+    a.stop({ drain: false });
   });
 
   test('fires for timeout path', async () => {

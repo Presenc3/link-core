@@ -1,0 +1,36 @@
+export {
+  LinkClient,
+  LinkClientOptions,
+  LinkClientEvents,
+
+  RpcOptions,
+  ReadyOptions,
+  WaitForOptions,
+  HealthSnapshot,
+
+  RpcHandler,
+  TopicHandler,
+  MessageEnvelope,
+  PeerInfo,
+  PeerStatus,
+  Logger,
+
+  ProtocolErrorReason,
+  ProtocolErrorInfo,
+  ProtocolErrorInfoBase,
+  ClientProtocolErrorReason,
+  ClientProtocolErrorInfo,
+
+  LinkError,
+  LinkErrorCode,
+  RpcError,
+  RpcAbortError,
+  RpcRemoteError,
+  RpcHandlerError,
+  RpcTimeoutError,
+  RpcDisconnectError,
+  BackpressureError,
+  LinkNotReadyError,
+  HelloRejectedError,
+  FeatureUnsupportedError,
+} from '../index';

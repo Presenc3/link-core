@@ -17,9 +17,9 @@
 
 const {
   LinkClient,
-  waitForPeer, rpcWithRetry,
   RpcRemoteError, RpcDisconnectError, RpcTimeoutError,
 } = require('../src/index.js');
+const { waitForPeer, rpcWithRetry } = require('@presenc3/link-helpers');
 
 const fn = '[ Co-ordinator ]';
 

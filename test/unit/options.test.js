@@ -56,6 +56,22 @@ describe('LinkClient option validation', () => {
     assert.throws    (ctor({ reconnectJitter: NaN }), TypeError);
   });
 
+  test('count/byte caps reject fractional values', () => {
+    for (const k of ['maxRecentIds', 'maxMessageBytes', 'maxBufferedBytes', 'maxOutboxBytes']) {
+      assert.throws(ctor({ [k]: 1024.5 }), TypeError, `${k} should reject 1024.5`);
+      assert.doesNotThrow(ctor({ [k]: 1024 }), `${k} should accept an integer`);
+    }
+  });
+
+  test('hashAlgo is validated against crypto.getHashes() at construction', () => {
+    assert.doesNotThrow(ctor({ hashAlgo: 'sha256' }));
+    assert.doesNotThrow(ctor({ hashAlgo: 'sha512' }));
+    assert.throws(ctor({ hashAlgo: 'sha-256' }), TypeError, 'typo should be rejected');
+    assert.throws(ctor({ hashAlgo: 'SHA256'  }), TypeError, 'wrong case should be rejected');
+    assert.throws(ctor({ hashAlgo: 'nope'    }), TypeError);
+    assert.throws(ctor({ hashAlgo: 42        }), TypeError);
+  });
+
   test('reconnectGrowth must be >= 1 (sub-1 would shrink backoff per attempt)', () => {
     assert.doesNotThrow(ctor({ reconnectGrowth: 1   }));
     assert.doesNotThrow(ctor({ reconnectGrowth: 2.5 }));

@@ -1,3 +1,4 @@
 'use strict';
-const { createHub } = require('./create-hub.js');
-module.exports = { createHub };
+const { createHubServer } = require('./server.js');
+const { createHub }       = require('./create-hub.js');
+module.exports = { createHub, createHubServer };

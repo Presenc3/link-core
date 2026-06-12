@@ -3,10 +3,11 @@
 const http = require('http');
 const { WebSocketServer } = require('ws');
 
-const { createHub } = require('./index.js');
+const { createHub } = require('./create-hub.js');
 const { DEFAULT_MAX_MESSAGE_BYTES } = require('./constants.js');
-const { noopLogger, consoleLogger } = require('../internal/logger.js');
-const { positiveFinite, nonNegFinite } = require('../internal/options.js');
+
+const { normalizeLogger } = require('../internal/logger.js');
+const { positiveFinite, nonNegFinite, nonNegInt, positiveInt } = require('../internal/options.js');
 
 const TAG = 'link-core:hub-server';
 
@@ -46,10 +47,17 @@ function createHubServer(opts = {}) {
 
     logger,
     hashAlgo,
+    canRpc,
+    canSend,
+    canPublish,
+    canSubscribe,
     maxRecentIds,
     replayWindowMs,
     helloTimeoutMs,
+    maxOutboxBytes,
+    exposeRpcErrors,
     maxBufferedBytes,
+    maxConcurrentRpc,
     maxPendingSockets,
     keepaliveIntervalMs,
     perMessageDeflate = false
@@ -57,12 +65,17 @@ function createHubServer(opts = {}) {
 
   if (secret == null) throw new Error('createHubServer({ secret }) is required');
 
-  const port              = nonNegFinite(  opts.port,              DEFAULT_PORT,                'port');
+  const port = nonNegInt(opts.port, DEFAULT_PORT, 'port');
+
+  if (port > 65535) {
+    throw new TypeError(`port: must be an integer in [0, 65535] (got ${port})`);
+  }
+
   const drainDelayMs      = nonNegFinite(  opts.drainDelayMs,      DEFAULT_DRAIN_DELAY_MS,      'drainDelayMs');
-  const maxMessageBytes   = positiveFinite(opts.maxMessageBytes,   DEFAULT_MAX_MESSAGE_BYTES,   'maxMessageBytes');
+  const maxMessageBytes   = positiveInt(   opts.maxMessageBytes,   DEFAULT_MAX_MESSAGE_BYTES,   'maxMessageBytes');
   const shutdownTimeoutMs = positiveFinite(opts.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS, 'shutdownTimeoutMs');
 
-  const log = logger === null ? noopLogger : (logger || consoleLogger);
+  const log = normalizeLogger(logger);
 
   if (!existingServer && enableStateRoute && host === '0.0.0.0') {
     log.warn(TAG,
@@ -78,11 +91,18 @@ function createHubServer(opts = {}) {
     hashAlgo,
     rpcHandlers,
     logger: log,
+    canRpc,
+    canSend,
+    canPublish,
+    canSubscribe,
     maxRecentIds,
     replayWindowMs,
     helloTimeoutMs,
+    maxOutboxBytes,
+    exposeRpcErrors,
     maxMessageBytes,
     maxBufferedBytes,
+    maxConcurrentRpc,
     maxPendingSockets,
     keepaliveIntervalMs,
   });
@@ -132,8 +152,10 @@ function createHubServer(opts = {}) {
               `${Array.isArray(extra) ? ', array' : ''}); ignored`);
           }
 
+          const json = JSON.stringify(merged, null, 2);
+
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(merged, null, 2));
+          res.end(json);
           return;
         }
 
@@ -146,6 +168,8 @@ function createHubServer(opts = {}) {
             res.writeHead(500, { 'content-type': 'text/plain' });
             res.end('internal error');
           } catch {}
+        } else if (!res.writableEnded) {
+          try { res.end(); } catch {}
         }
       }
     });
@@ -169,6 +193,7 @@ function createHubServer(opts = {}) {
     );
   }
 
+  let startPromise   = null;
   let stopPromise    = null;
   let started        = false;
   let stopping       = false;
@@ -176,119 +201,134 @@ function createHubServer(opts = {}) {
   const signalHandlers = new Map();
 
   async function start() {
-    if (stopped) {
+    if (stopped || stopping) {
       throw new Error('createHubServer is single-shot; call createHubServer() again to start a new server');
     }
-    
+
     if (started) return;
 
-    if (ownsHttpServer) {
-      await new Promise((resolve, reject) => {
-        const onError     = (e) => { httpServer.off('listening', onListening); reject(e); };
-        const onListening = ()   => { httpServer.off('error',    onError);     resolve(); };
+    if (startPromise) return startPromise;
 
-        httpServer.once('error',     onError);
-        httpServer.once('listening', onListening);
-        httpServer.listen(port, host);
-      });
+    startPromise = (async () => {
+      try {
+        if (ownsHttpServer) {
+          await new Promise((resolve, reject) => {
+            const onError     = (e) => { httpServer.off('listening', onListening); reject(e); };
+            const onListening = ()   => { httpServer.off('error',    onError);     resolve(); };
 
-      log.log(TAG, `listening on http://${host}:${port}`);
-      log.log(TAG, `ws on ws://${host}:${port}${wsPath || ''}`);
+            httpServer.once('error',     onError);
+            httpServer.once('listening', onListening);
+            httpServer.listen(port, host);
+          });
 
-    } else {
-      log.log(TAG, 'attached to user-provided http server');
-    }
+          const addr       = httpServer.address();
+          const actualPort = (addr && typeof addr === 'object') ? addr.port : port;
 
-    started = true;
+          log.info(TAG, `listening on http://${host}:${actualPort}`);
+          log.info(TAG, `ws on ws://${host}:${actualPort}${wsPath || ''}`);
 
-    if (handleSignals) {
-      for (const sig of signals) {
-        const handler = () => { stop(sig).catch((e) => log.warn(TAG, 'stop() failed:', e?.message || e)); };
-        signalHandlers.set(sig, handler);
-        process.on(sig, handler);
+        } else {
+          log.info(TAG, 'attached to user-provided http server');
+        }
+
+        started = true;
+
+        if (handleSignals) {
+          for (const sig of signals) {
+            const handler = () => { stop(sig).catch((e) => log.warn(TAG, 'stop() failed:', e?.message || e)); };
+            signalHandlers.set(sig, handler);
+            process.on(sig, handler);
+          }
+        }
+      } catch (e) {
+        startPromise = null;
+        throw e;
       }
-    }
+    })();
+
+    return startPromise;
   }
 
   async function stop(reason) {
     if (stopPromise) return stopPromise;
     if (stopped) return Promise.resolve();
 
-    if (!started) {
-      try { wss.close(); } catch (e) { log.warn(TAG, 'wss.close() error:',  e?.message || e); }
-      try { hub.stop();  } catch (e) { log.warn(TAG, 'hub.stop() error:',   e?.message || e); }
-
-      stopped = true;
-      return Promise.resolve();
-    }
-
     stopping = true;
-    let timeoutHandle = null;
-
-    log.log(TAG, `shutting down${reason ? ` (${reason})` : ''}...`);
-
-    const timeout = new Promise((_, reject) => {
-      timeoutHandle = setTimeout(
-        () => reject(new Error(`shutdown timeout after ${shutdownTimeoutMs}ms`)),
-        shutdownTimeoutMs,
-      );
-
-      timeoutHandle.unref?.();
-    });
-
-    const work = (async () => {
-      const wssClosed = new Promise((resolve) => {
-        wss.once('close', resolve);
-      });
-
-      try { wss.close(); }
-      catch (e) { log.warn(TAG, 'wss.close() error:', e?.message || e); }
-
-      for (const ws of wss.clients) {
-        try { ws.close(1001, 'server shutdown'); } catch {}
-      }
-
-      await new Promise((r) => setTimeout(r, drainDelayMs));
-
-      for (const ws of wss.clients) {
-        try { if (ws.readyState !== WS_CLOSED) ws.terminate(); } catch {}
-      }
-
-      try { await wssClosed; } catch {}
-
-      if (ownsHttpServer) {
-        try { await new Promise((r) => httpServer.close(() => r())); }
-        catch (e) { log.warn(TAG, 'httpServer.close() error:', e?.message || e); }
-      }
-
-      try { hub.stop(); }
-      catch (e) { log.warn(TAG, 'hub.stop() error:', e?.message || e); }
-
-      if (typeof onShutdown === 'function') {
-        try { await onShutdown(); }
-        catch (e) { log.warn(TAG, 'onShutdown() threw:', e?.message || e); }
-      }
-
-      for (const [sig, handler] of signalHandlers.entries()) {
-        try { process.off(sig, handler); } catch {}
-      }
-      signalHandlers.clear();
-    })();
 
     stopPromise = (async () => {
+      let timeoutHandle = null;
       try {
+        if (startPromise) {
+          try { await startPromise; } catch { }
+        }
+
+        if (!started) {
+          try { wss.close(); } catch (e) { log.warn(TAG, 'wss.close() error:',  e?.message || e); }
+          try { hub.stop();  } catch (e) { log.warn(TAG, 'hub.stop() error:',   e?.message || e); }
+          return;
+        }
+
+        log.info(TAG, `shutting down${reason ? ` (${reason})` : ''}...`);
+
+        const timeout = new Promise((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error(`shutdown timeout after ${shutdownTimeoutMs}ms`)),
+            shutdownTimeoutMs,
+          );
+
+          timeoutHandle.unref?.();
+        });
+
+        const work = (async () => {
+          const wssClosed = new Promise((resolve) => {
+            wss.once('close', resolve);
+          });
+
+          try { wss.close(); }
+          catch (e) { log.warn(TAG, 'wss.close() error:', e?.message || e); }
+
+          for (const ws of wss.clients) {
+            try { ws.close(1001, 'server shutdown'); } catch {}
+          }
+
+          await new Promise((r) => setTimeout(r, drainDelayMs));
+
+          for (const ws of wss.clients) {
+            try { if (ws.readyState !== WS_CLOSED) ws.terminate(); } catch {}
+          }
+
+          try { await wssClosed; } catch {}
+
+          if (ownsHttpServer) {
+            try { await new Promise((r) => httpServer.close(() => r())); }
+            catch (e) { log.warn(TAG, 'httpServer.close() error:', e?.message || e); }
+          }
+
+          try { hub.stop(); }
+          catch (e) { log.warn(TAG, 'hub.stop() error:', e?.message || e); }
+
+          if (typeof onShutdown === 'function') {
+            try { await onShutdown(); }
+            catch (e) { log.warn(TAG, 'onShutdown() threw:', e?.message || e); }
+          }
+        })();
+
         await Promise.race([work, timeout]);
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-
-        log.log(TAG, 'shutdown complete');
+        log.info(TAG, 'shutdown complete');
       } catch (e) {
-        if (timeoutHandle) clearTimeout(timeoutHandle);
         log.warn(TAG, 'shutdown error:', e?.message || e);
-
         throw e;
       } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+
+        for (const [sig, handler] of signalHandlers.entries()) {
+          try { process.off(sig, handler); } catch {}
+        }
+        signalHandlers.clear();
+
         stopping    = false;
         stopped     = true;
+        started     = false;
         stopPromise = null;
       }
     })();

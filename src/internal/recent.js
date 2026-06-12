@@ -42,7 +42,7 @@ class RecentIds {
       this.entries.delete(id);
       return false;
     }
-    
+
     return true;
   }
 
@@ -69,4 +69,67 @@ class RecentIds {
   clear() { this.entries.clear(); }
 }
 
-module.exports = { RecentIds };
+/**
+ * Per-peer replay cache: keeps an independent `RecentIds` window per
+ * sender so a single noisy peer cannot LRU-evict the recent-id history
+ * of unrelated peers (which would silently narrow everyone else's
+ * replay-protection window).
+ *
+ * `maxCount` is the cap *per peer*, not a global cap - total worst-case
+ * footprint is `maxCount * (number of distinct senders)`. Sender kinds
+ * are bounded by the service roster in practice, so this stays small.
+ */
+class PeerRecentIds {
+  constructor({ maxAgeMs, maxCount }) {
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+      throw new Error('PeerRecentIds: maxAgeMs must be a positive finite number');
+    }
+
+    if (!Number.isFinite(maxCount) || maxCount <= 0) {
+      throw new Error('PeerRecentIds: maxCount must be a positive finite number');
+    }
+
+    this._maxAgeMs = maxAgeMs;
+    this._maxCount = maxCount;
+    this._peers    = new Map();
+  }
+
+  _for(peer) {
+    let r = this._peers.get(peer);
+    if (!r) {
+      r = new RecentIds({ maxAgeMs: this._maxAgeMs, maxCount: this._maxCount });
+      this._peers.set(peer, r);
+    }
+    return r;
+  }
+
+  /** True if `id` was already seen from `peer` within the window. */
+  has(peer, id) {
+    const r = this._peers.get(peer);
+    return r ? r.has(id) : false;
+  }
+
+  /** Record `id` as seen from `peer`. */
+  add(peer, id) {
+    this._for(peer).add(id);
+  }
+
+  /** Drop a peer's entire window (e.g. on disconnect). */
+  forget(peer) {
+    return this._peers.delete(peer);
+  }
+
+  /** Total ids cached across all peers. */
+  size() {
+    let n = 0;
+    for (const r of this._peers.values()) n += r.size();
+    return n;
+  }
+
+  /** Number of distinct peers currently tracked. */
+  peerCount() { return this._peers.size; }
+
+  clear() { this._peers.clear(); }
+}
+
+module.exports = { RecentIds, PeerRecentIds };

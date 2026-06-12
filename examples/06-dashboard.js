@@ -25,12 +25,12 @@
 
 const http = require('http');
 
+const { LinkClient } = require('../src/index.js');
 const {
-    LinkClient,
     createLogger,
     createEventRecorder,
     attachClientObservability
-} = require('../src/index.js');
+} = require('@presenc3/link-helpers');
 
 const ctx = 'dashboard';
 const log = createLogger({ minLevel: 'INFO' });
